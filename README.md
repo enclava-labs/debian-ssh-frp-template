@@ -21,12 +21,12 @@ still contain the affected dependencies.
 
 ## Signed image
 
-Every push to `main` publishes `ghcr.io/enclava-labs/debian-ssh-frp-template`
+Every push to `main` publishes `ghcr.io/enclava-labs/debian-ssh-frp`
 and signs the pushed digest keylessly from `.github/workflows/image.yml`.
 Enclava PaaS accepts only digests signed by that identity:
 
 ```sh
-cosign verify ghcr.io/enclava-labs/debian-ssh-frp-template@sha256:<digest> \
+cosign verify ghcr.io/enclava-labs/debian-ssh-frp@sha256:<digest> \
   --certificate-identity https://github.com/enclava-labs/debian-ssh-frp-template/.github/workflows/image.yml@refs/heads/main \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

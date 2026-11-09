@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE_REPOSITORY: ghcr.io/enclava-labs/debian-ssh-frp-template
+  IMAGE_REPOSITORY: ghcr.io/enclava-labs/debian-ssh-frp
   MANUAL_VERSION_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag || '' }}
 
 jobs:
