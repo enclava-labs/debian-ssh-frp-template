@@ -101,6 +101,21 @@ BOOTSTRAP_VOLUME="$("${DOCKER[@]}" volume create "debian-ssh-frp-runtime-bootstr
     chmod 0640 /state/app-data/.enclava/luks-ready "$customer_dir"/*
     chmod 0700 /state/.enclava /state/.enclava/config
     chmod 0600 /state/.enclava/luks-ready "$managed_dir"/*
+    mkdir -p /state/app-data/home/user/health /state/app-data/.enclava/debian-ssh-frp/public
+    printf "%s\n" OLD-DEBUG > /state/app-data/home/user/health/debug.txt
+    printf "%s\n" OLD-STARTUP > /state/app-data/home/user/health/startup-error.txt
+    printf "%s\n" "#!/bin/sh" > /state/app-data/home/user/health/monitor.cgi
+    printf "%s\n" customer-httpd > /state/app-data/home/user/health/httpd.conf
+    printf "%s\n" OLD-PUBLIC-DEBUG > /state/app-data/.enclava/debian-ssh-frp/public/debug.txt
+    printf "%s\n" "#!/bin/sh" "echo Content-type: text/plain" "echo" "echo CGI-RAN" "id" > /state/app-data/.enclava/debian-ssh-frp/public/leak.cgi
+    chmod 755 /state/app-data/.enclava/debian-ssh-frp/public/leak.cgi
+    printf "%s\n" "*.cgi:/bin/sh" > /state/app-data/.enclava/debian-ssh-frp/public/httpd.conf
+    mkdir -p /state/app-data/.enclava/debian-ssh-frp/public/cgi-bin /state/app-data/.enclava/debian-ssh-frp/public/sub
+    printf "%s\n" "#!/bin/sh" "echo Content-type: text/plain" "echo" "echo CGI-BIN-RAN" "id" > /state/app-data/.enclava/debian-ssh-frp/public/cgi-bin/x
+    chmod 755 /state/app-data/.enclava/debian-ssh-frp/public/cgi-bin/x
+    printf "%s\n" "*.cgi:/bin/sh" > /state/app-data/.enclava/debian-ssh-frp/public/sub/httpd.conf
+    printf "%s\n" "#!/bin/sh" "echo Content-type: text/plain" "echo" "echo SUBCGI-RAN" "id" > /state/app-data/.enclava/debian-ssh-frp/public/sub/y.cgi
+    chmod 755 /state/app-data/.enclava/debian-ssh-frp/public/sub/y.cgi
   '
 
 CID="$("${DOCKER[@]}" run -d \
@@ -138,11 +153,11 @@ for _ in {1..60}; do
       test -f /state/app-data/.enclava/frp/admin-curl.conf &&
       test "$(stat -c "%a" /state/app-data/.enclava/frp/admin-curl.conf)" = 600 &&
       test ! -e /home/user/.config/frp/frpc.toml &&
-      grep -q "reason=config_ready" /home/user/health/debug.txt &&
-      grep -q "dir\\[2\\].stat=type=directory mode=700 uid=0 gid=0" /home/user/health/debug.txt &&
-      test -f /home/user/health/healthz &&
-      test -f /home/user/health/ssh.txt &&
-      test -f /home/user/health/frp-url.txt &&
+      grep -q "reason=config_ready" /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt &&
+      grep -q "dir\\[2\\].stat=type=directory mode=700 uid=0 gid=0" /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt &&
+      test -f /state/app-data/.enclava/debian-ssh-frp/public/healthz &&
+      test -f /state/app-data/.enclava/debian-ssh-frp/public/ssh.txt &&
+      test -f /state/app-data/.enclava/debian-ssh-frp/public/frp-url.txt &&
       test -f /state/app-data/.enclava/frp/frpc.log &&
       grep -q "fake frpc started" /state/app-data/.enclava/frp/frpc.log &&
       test -f /state/app-data/.enclava/frp/ready-seen &&
@@ -176,11 +191,34 @@ done
   test -f /state/app-data/.enclava/frp/admin-curl.conf &&
   test "$(stat -c "%a" /state/app-data/.enclava/frp/admin-curl.conf)" = 600 &&
   test ! -e /home/user/.config/frp/frpc.toml &&
-  grep -q "reason=config_ready" /home/user/health/debug.txt &&
-  grep -q "dir\\[2\\].stat=type=directory mode=700 uid=0 gid=0" /home/user/health/debug.txt &&
-  test -f /home/user/health/healthz &&
-  test -f /home/user/health/ssh.txt &&
-  test -f /home/user/health/frp-url.txt &&
+  grep -q "reason=config_ready" /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt &&
+  grep -q "dir\\[2\\].stat=type=directory mode=700 uid=0 gid=0" /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt &&
+  test ! -e /home/user/health/debug.txt &&
+  test ! -e /home/user/health/startup-error.txt &&
+  test -f /home/user/health/monitor.cgi &&
+  test -f /home/user/health/httpd.conf &&
+  test "$(stat -c %a /state/app-data/.enclava/debian-ssh-frp/diag)" = 700 &&
+  test "$(stat -c %a /state/app-data/.enclava/debian-ssh-frp/public)" = 700 &&
+  test ! -e /state/app-data/.enclava/debian-ssh-frp/public/debug.txt &&
+  test ! -e /state/app-data/.enclava/debian-ssh-frp/public/leak.cgi &&
+  test ! -e /state/app-data/.enclava/debian-ssh-frp/public/httpd.conf &&
+  test "$(/usr/bin/curl -fsS --max-time 2 http://127.0.0.1:8080/healthz)" = ok &&
+  ! /usr/bin/curl -fsS --max-time 2 http://127.0.0.1:8080/debug.txt &&
+  ! /usr/bin/curl -fsS --max-time 2 http://127.0.0.1:8080/startup-error.txt &&
+  ! /usr/bin/curl -fsS --max-time 2 http://127.0.0.1:8080/healthz.tmp &&
+  ! /usr/bin/curl -fsS --max-time 2 http://127.0.0.1:8080/ssh.txt.tmp &&
+  ! /usr/bin/curl -fsS --max-time 2 http://127.0.0.1:8080/frp-url.txt.tmp &&
+  ! /usr/bin/curl -fsS --max-time 2 http://127.0.0.1:8080/leak.cgi &&
+  ! /usr/bin/curl -fsS --max-time 2 http://127.0.0.1:8080/cgi-bin/x &&
+  ! /usr/bin/curl -fsS --max-time 2 http://127.0.0.1:8080/sub/y.cgi &&
+  test ! -d /state/app-data/.enclava/debian-ssh-frp/public/cgi-bin &&
+  test ! -e /state/app-data/.enclava/debian-ssh-frp/public/sub/y.cgi &&
+  /usr/bin/curl -fsS --max-time 2 http://127.0.0.1:18080/debug.txt | grep -q reason=config_ready &&
+  awk '"'"'$2 ~ /:46A0$/ && $2 !~ /^0100007F:/ { bad=1 } END { exit bad ? 1 : 0 }'"'"' /proc/net/tcp &&
+  if [ -r /proc/net/tcp6 ]; then awk '"'"'$2 ~ /:46A0$/ { bad=1 } END { exit bad ? 1 : 0 }'"'"' /proc/net/tcp6; fi &&
+  test -f /state/app-data/.enclava/debian-ssh-frp/public/healthz &&
+  test -f /state/app-data/.enclava/debian-ssh-frp/public/ssh.txt &&
+  test -f /state/app-data/.enclava/debian-ssh-frp/public/frp-url.txt &&
   test -f /state/app-data/.enclava/frp/frpc.log &&
   grep -q "fake frpc started" /state/app-data/.enclava/frp/frpc.log &&
   test -f /state/app-data/.enclava/frp/ready-seen &&
@@ -210,9 +248,9 @@ CID=""
     set -eu
     rm -rf /state/app-data/.enclava/config
     rm -f /state/app-data/.enclava/luks-ready
-    rm -f /state/app-data/home/user/health/healthz
-    rm -f /state/app-data/home/user/health/ssh.txt
-    rm -f /state/app-data/home/user/health/frp-url.txt
+    rm -f /state/app-data/.enclava/debian-ssh-frp/public/healthz
+    rm -f /state/app-data/.enclava/debian-ssh-frp/public/ssh.txt
+    rm -f /state/app-data/.enclava/debian-ssh-frp/public/frp-url.txt
     for key in FRP_SERVER_ADDR FRP_SERVER_PORT FRP_AUTH_TOKEN FRP_PROXY_NAME FRP_PROXY_TYPE FRP_REMOTE_PORT FRP_LOCAL_ADDR FRP_LOCAL_PORT FRP_TUNNEL_CREDENTIAL_ID FRP_TUNNEL_SECRET FRP_PUBLIC_HOST DEBIAN_SSH_AUTHORIZED_KEYS; do
       test -s "/state/app-data/.enclava/debian-ssh-frp/config/$key"
     done
@@ -239,12 +277,12 @@ for _ in {1..30}; do
       test ! -e /state/app-data/.enclava/config &&
       test ! -e /state/.enclava/config &&
       test "$(cat /home/user/issue26-recovery-marker)" = issue26-durable-state &&
-      grep -q "reason=config_ready" /home/user/health/debug.txt &&
-      grep -q "key=FRP_AUTH_TOKEN env=present" /home/user/health/debug.txt &&
-      grep -q "complete=yes" /home/user/health/debug.txt &&
-      test -f /home/user/health/healthz &&
-      test -f /home/user/health/ssh.txt &&
-      test -f /home/user/health/frp-url.txt &&
+      grep -q "reason=config_ready" /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt &&
+      grep -q "key=FRP_AUTH_TOKEN env=present" /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt &&
+      grep -q "complete=yes" /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt &&
+      test -f /state/app-data/.enclava/debian-ssh-frp/public/healthz &&
+      test -f /state/app-data/.enclava/debian-ssh-frp/public/ssh.txt &&
+      test -f /state/app-data/.enclava/debian-ssh-frp/public/frp-url.txt &&
       grep -q "fake frpc started" /state/app-data/.enclava/frp/frpc.log
     ' >/dev/null 2>&1; then
     break
@@ -256,12 +294,12 @@ done
   test ! -e /state/app-data/.enclava/config &&
   test ! -e /state/.enclava/config &&
   test "$(cat /home/user/issue26-recovery-marker)" = issue26-durable-state &&
-  grep -q "reason=config_ready" /home/user/health/debug.txt &&
-  grep -q "key=FRP_AUTH_TOKEN env=present" /home/user/health/debug.txt &&
-  grep -q "complete=yes" /home/user/health/debug.txt &&
-  test -f /home/user/health/healthz &&
-  test -f /home/user/health/ssh.txt &&
-  test -f /home/user/health/frp-url.txt &&
+  grep -q "reason=config_ready" /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt &&
+  grep -q "key=FRP_AUTH_TOKEN env=present" /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt &&
+  grep -q "complete=yes" /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt &&
+  test -f /state/app-data/.enclava/debian-ssh-frp/public/healthz &&
+  test -f /state/app-data/.enclava/debian-ssh-frp/public/ssh.txt &&
+  test -f /state/app-data/.enclava/debian-ssh-frp/public/frp-url.txt &&
   grep -q "fake frpc started" /state/app-data/.enclava/frp/frpc.log
 ' >/dev/null || {
   "${DOCKER[@]}" logs "${CID}" >&2 || true
@@ -276,7 +314,9 @@ done
   test ! -r /state/app-data/.enclava/frp/server_token &&
   test ! -r /state/app-data/.enclava/frp/admin-curl.conf &&
   test ! -r /state/app-data/.enclava/debian-ssh-frp/config/FRP_AUTH_TOKEN &&
-  test ! -r /state/app-data/.enclava/debian-ssh-frp/config/FRP_TUNNEL_SECRET
+  test ! -r /state/app-data/.enclava/debian-ssh-frp/config/FRP_TUNNEL_SECRET &&
+  # Direct read is denied. Loopback HTTP on 127.0.0.1:18080 is the intentional in-guest read path.
+  test ! -r /state/app-data/.enclava/debian-ssh-frp/diag/debug.txt
 ' >/dev/null || {
   "${DOCKER[@]}" exec "${CID}" /bin/sh -c 'ls -ldn /state/.enclava /state/.enclava/config /state/app-data/.enclava /state/app-data/.enclava/frp /state/app-data/.enclava/debian-ssh-frp/config 2>/dev/null || true' >&2 || true
   fail "tenant SSH user can read platform-managed FRP credentials"
@@ -287,9 +327,9 @@ done
 "${DOCKER[@]}" exec "${CID}" /bin/sh -c '
   printf "%s\n" corrupt-readiness-key-bytes >/state/app-data/home/user/.ssh/ssh_ready_ed25519_key
   printf "%s\n" corrupt-host-key-bytes >/state/app-data/home/user/.ssh/dropbear_ed25519_host_key
-  rm -f /state/app-data/home/user/health/healthz
-  rm -f /state/app-data/home/user/health/ssh.txt
-  rm -f /state/app-data/home/user/health/frp-url.txt
+  rm -f /state/app-data/.enclava/debian-ssh-frp/public/healthz
+  rm -f /state/app-data/.enclava/debian-ssh-frp/public/ssh.txt
+  rm -f /state/app-data/.enclava/debian-ssh-frp/public/frp-url.txt
 '
 
 "${DOCKER[@]}" stop -t 10 "${CID}" >/dev/null
@@ -317,7 +357,7 @@ for _ in {1..30}; do
       ssh-keygen -y -f /home/user/.ssh/ssh_ready_ed25519_key >/dev/null 2>&1 &&
       dropbearkey -y -f /home/user/.ssh/dropbear_ed25519_host_key >/dev/null 2>&1 &&
       test -s /home/user/.ssh/ssh_ready_ed25519_key.pub &&
-      test -f /home/user/health/healthz
+      test -f /state/app-data/.enclava/debian-ssh-frp/public/healthz
     ' >/dev/null 2>&1; then
     break
   fi
@@ -330,7 +370,7 @@ done
   ssh-keygen -y -f /home/user/.ssh/ssh_ready_ed25519_key >/dev/null 2>&1 &&
   dropbearkey -y -f /home/user/.ssh/dropbear_ed25519_host_key >/dev/null 2>&1 &&
   test -s /home/user/.ssh/ssh_ready_ed25519_key.pub &&
-  test -f /home/user/health/healthz
+  test -f /state/app-data/.enclava/debian-ssh-frp/public/healthz
 ' >/dev/null || {
   "${DOCKER[@]}" logs "${CID}" >&2 || true
   fail "runtime image did not regenerate corrupted persistent SSH keys"

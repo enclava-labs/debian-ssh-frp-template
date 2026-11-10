@@ -24,7 +24,10 @@ export DEBIAN_SSH_FRP_ENTRYPOINT_TEST=1
 export DEBIAN_SSH_HOME="${WORKDIR}/home"
 export DEBIAN_SSH_READY_KEY="${DEBIAN_SSH_HOME}/.ssh/ssh_ready_ed25519_key"
 export DEBIAN_SSH_HOST_KEY="${DEBIAN_SSH_HOME}/.ssh/dropbear_ed25519_host_key"
-export DEBIAN_SSH_DEBUG_FILE="${DEBIAN_SSH_HOME}/health/debug.txt"
+export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${WORKDIR}/public-health"
+export DEBIAN_SSH_LOCAL_DIAG_DIR="${WORKDIR}/diag"
+export DEBIAN_SSH_DEBUG_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/debug.txt"
+export DEBIAN_SSH_STARTUP_ERROR_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/startup-error.txt"
 export DEBIAN_SSH_PERSISTENCE_PATH="${WORKDIR}/persistent-state"
 export DEBIAN_FRP_STATE_DIR="${WORKDIR}/frp-state"
 export DEBIAN_FRP_CONFIG_FILE="${DEBIAN_FRP_STATE_DIR}/frpc.toml"
@@ -258,6 +261,104 @@ test "$(stat -c "%a" "${DEBIAN_FRP_ADMIN_CURL_CONFIG}")" = "600"
 test "$(stat -c "%a" "${DEBIAN_FRP_CONFIG_FILE}")" = "600"
 test ! -e "${DEBIAN_SSH_HOME}/.config/frp/frpc.toml"
 test "$(stat -c "%a" "${DEBIAN_FRP_STATE_DIR}")" = "700"
+grep -qx 'transport.tls.enable = true' "${DEBIAN_FRP_CONFIG_FILE}"
+test "$(grep -c '^transport.tls.enable = ' "${DEBIAN_FRP_CONFIG_FILE}")" = "1"
+grep -qx 'type = "tcp"' "${DEBIAN_FRP_CONFIG_FILE}"
+grep -qx 'localIP = "127.0.0.1"' "${DEBIAN_FRP_CONFIG_FILE}"
+
+assert_render_rejects() {
+  label="$1"
+  pattern="$2"
+  err="${WORKDIR}/reject-${label}.err"
+  before_cfg="$(cksum "${DEBIAN_FRP_CONFIG_FILE}")"
+  before_tok="$(cksum "${DEBIAN_FRP_TOKEN_FILE}")"
+  before_curl="$(cksum "${DEBIAN_FRP_ADMIN_CURL_CONFIG}")"
+  if render_frpc_config 2>"${err}"; then
+    echo "error: ${label} was accepted" >&2
+    exit 1
+  fi
+  test "${before_cfg}" = "$(cksum "${DEBIAN_FRP_CONFIG_FILE}")"
+  test "${before_tok}" = "$(cksum "${DEBIAN_FRP_TOKEN_FILE}")"
+  test "${before_curl}" = "$(cksum "${DEBIAN_FRP_ADMIN_CURL_CONFIG}")"
+  test "$(grep -c '^\[\[proxies\]\]$' "${DEBIAN_FRP_CONFIG_FILE}")" = "1"
+  grep -q "${pattern}" "${err}"
+  grep -qx 'transport.tls.enable = true' "${DEBIAN_FRP_CONFIG_FILE}"
+  if grep -q 'enable = false' "${DEBIAN_FRP_CONFIG_FILE}"; then
+    echo "error: ${label} wrote tls disable into frpc.toml" >&2
+    exit 1
+  fi
+}
+
+FRP_TLS_ENABLE=false
+assert_render_rejects tls-false "TLS cannot be disabled"
+unset FRP_TLS_ENABLE
+
+saved_name="${FRP_PROXY_NAME}"
+FRP_PROXY_NAME="$(printf 'qa-shell"\n[[proxies]]\nname = "evil')"
+assert_render_rejects proxy-inject "FRP_PROXY_NAME must be a single"
+FRP_PROXY_NAME="${saved_name}"
+
+saved_secret="${FRP_TUNNEL_SECRET}"
+FRP_TUNNEL_SECRET='secret"injected'
+assert_render_rejects secret-inject "FRP_TUNNEL_SECRET must be a single safe token"
+FRP_TUNNEL_SECRET="${saved_secret}"
+
+saved_type="${FRP_PROXY_TYPE}"
+FRP_PROXY_TYPE="$(printf 'tcp"\n[[proxies]]\nname = "evil')"
+assert_render_rejects type-inject "FRP_PROXY_TYPE must be tcp"
+FRP_PROXY_TYPE="${saved_type}"
+
+saved_addr="${FRP_LOCAL_ADDR}"
+FRP_LOCAL_ADDR="10.0.0.1"
+assert_render_rejects local-addr "FRP_LOCAL_ADDR must be 127.0.0.1"
+FRP_LOCAL_ADDR="${saved_addr}"
+
+saved_org="${ENCLAVA_ORG_ID}"
+ENCLAVA_ORG_ID="$(printf 'org\n[[proxies]]')"
+assert_render_rejects org-inject "ENCLAVA_ORG_ID must be a single"
+ENCLAVA_ORG_ID="${saved_org}"
+
+saved_token="${FRP_AUTH_TOKEN}"
+FRP_AUTH_TOKEN="$(printf 'token\ninjected')"
+assert_render_rejects token-newline "FRP_AUTH_TOKEN must be a single token without whitespace"
+# Quote and backslash match frp::validate_single_token. They must land in
+# the token file only, never in frpc.toml or the admin curl config.
+quoted_token="$(printf '%s' "abc'def\"ghi\\bar")"
+FRP_AUTH_TOKEN="$quoted_token"
+render_frpc_config
+test "$(cat "${DEBIAN_FRP_TOKEN_FILE}")" = "$quoted_token"
+if grep -F "$quoted_token" "${DEBIAN_FRP_CONFIG_FILE}" "${DEBIAN_FRP_ADMIN_CURL_CONFIG}"; then
+  echo "error: login token was interpolated into frpc config" >&2
+  exit 1
+fi
+grep -F "auth.tokenSource.file.path = \"${DEBIAN_FRP_TOKEN_FILE}\"" "${DEBIAN_FRP_CONFIG_FILE}"
+grep -qx 'transport.tls.enable = true' "${DEBIAN_FRP_CONFIG_FILE}"
+test "$(grep -c '^\[\[proxies\]\]$' "${DEBIAN_FRP_CONFIG_FILE}")" = "1"
+FRP_AUTH_TOKEN='bootstrap+token/with=pads'
+render_frpc_config
+test "$(cat "${DEBIAN_FRP_TOKEN_FILE}")" = "bootstrap+token/with=pads"
+grep -qx 'transport.tls.enable = true' "${DEBIAN_FRP_CONFIG_FILE}"
+FRP_AUTH_TOKEN="${saved_token}"
+render_frpc_config
+test "$(cat "${DEBIAN_FRP_TOKEN_FILE}")" = "bootstrap-token-for-test"
+grep -q 'name = "qa-shell"' "${DEBIAN_FRP_CONFIG_FILE}"
+
+if validate_host FRP_PUBLIC_HOST "$(printf 'relay.enclava.me\nevil.example')" 2>"${WORKDIR}/multiline-host.err"; then
+  echo "error: multiline FRP host was accepted" >&2
+  exit 1
+fi
+grep -q "FRP_PUBLIC_HOST must be a single line" "${WORKDIR}/multiline-host.err"
+
+if validate_secret_path DEBIAN_FRP_TOKEN_FILE "/state/app-data/.enclava/frp/server_token"; then
+  :
+else
+  echo "error: default token path was rejected" >&2
+  exit 1
+fi
+if validate_secret_path DEBIAN_FRP_TOKEN_FILE "/state/app-data/.enclava/../../etc/passwd"; then
+  echo "error: token path traversal was accepted" >&2
+  exit 1
+fi
 
 MOCK_BIN="${WORKDIR}/mock-bin"
 mkdir -p "${MOCK_BIN}"
@@ -395,20 +496,43 @@ if (
   exit 1
 fi
 
+mkdir -p "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}"
+# A sibling the tenant already uses must survive publish. The old fixed
+# stage name lived here and was chmod'd and truncated.
+mkdir -p "${WORKDIR}/.enclava-health-stage"
+printf 'tenant-secret\n' >"${WORKDIR}/.enclava-health-stage/ssh.txt"
+printf 'other\n' >"${WORKDIR}/.enclava-health-stage/notes.txt"
+chmod 755 "${WORKDIR}/.enclava-health-stage"
+stage_mode="$(stat -c %a "${WORKDIR}/.enclava-health-stage")"
 publish_ready
-test "$(cat "${DEBIAN_SSH_HOME}/health/ssh.txt")" = "ssh -p 22001 user@relay.enclava.me"
-test "$(cat "${DEBIAN_SSH_HOME}/health/frp-url.txt")" = "tcp://relay.enclava.me:22001"
-test "$(cat "${DEBIAN_SSH_HOME}/health/healthz")" = "ok"
+test "$(cat "${WORKDIR}/.enclava-health-stage/ssh.txt")" = "tenant-secret"
+test "$(cat "${WORKDIR}/.enclava-health-stage/notes.txt")" = "other"
+test "$(stat -c %a "${WORKDIR}/.enclava-health-stage")" = "${stage_mode}"
+if find "${WORKDIR}" -maxdepth 1 -name '.enclava-health-stage.*' -print | grep -q .; then
+  echo "error: health publish stage was left beside the public root" >&2
+  exit 1
+fi
+test "$(cat "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/ssh.txt")" = "ssh -p 22001 user@relay.enclava.me"
+test "$(cat "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/frp-url.txt")" = "tcp://relay.enclava.me:22001"
+test "$(cat "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/healthz")" = "ok"
+test ! -e "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/ssh.txt.tmp"
+test ! -e "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/frp-url.txt.tmp"
+test ! -e "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/healthz.tmp"
+published_names="$(cd "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}" && find . -mindepth 1 -print | sed 's|^\./||' | sort | tr '\n' ' ')"
+test "${published_names}" = "frp-url.txt healthz ssh.txt "
 
 if (
   export DEBIAN_SSH_WRAPPED=1
   export DEBIAN_SSH_HOME="${WORKDIR}/wrapped-home"
+  export DEBIAN_SSH_STARTUP_ERROR_FILE="${WORKDIR}/wrapped-home/diag/startup-error.txt"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${WORKDIR}/wrapped-home/health"
   fail "wrapped failure test"
 ); then
   echo "error: wrapped failure did not exit non-zero" >&2
   exit 1
 fi
-test "$(cat "${WORKDIR}/wrapped-home/health/startup-error.txt")" = "wrapped failure test"
+test "$(cat "${WORKDIR}/wrapped-home/diag/startup-error.txt")" = "wrapped failure test"
+test ! -e "${WORKDIR}/wrapped-home/health/startup-error.txt"
 
 if grep -q "lio@beast" "${ENTRYPOINT}"; then
   echo "error: committed support key is still present in entrypoint" >&2
@@ -718,5 +842,744 @@ rm -f "${WORKDIR}/marker-once"
   exit 1
 }
 grep -Fq "DEBIAN_SSH_MAX_RESTARTS must be an integer" "${WORKDIR}/bad-budget.err"
+
+# Issue #237: the public app port must not publish debug or startup-error.
+(
+  unset DEBIAN_SSH_DEBUG_FILE
+  unset DEBIAN_SSH_STARTUP_ERROR_FILE
+  unset DEBIAN_SSH_PUBLIC_HEALTH_DIR
+  unset DEBIAN_SSH_LOCAL_DIAG_DIR
+  export DEBIAN_SSH_FRP_ENTRYPOINT_TEST=1
+  export DEBIAN_SSH_HOME="${WORKDIR}/default-diag-home"
+  # shellcheck source=../deployment-templates/debian-ssh-frp/entrypoint.sh
+  . "${ENTRYPOINT}"
+  case "${DEBIAN_SSH_DEBUG_FILE}" in
+    "${DEBIAN_SSH_HOME}/health"|"${DEBIAN_SSH_HOME}/health"/*)
+      echo "error: default debug file is inside the public health root" >&2
+      exit 1
+      ;;
+  esac
+  case "${DEBIAN_SSH_STARTUP_ERROR_FILE}" in
+    "${DEBIAN_SSH_HOME}/health"|"${DEBIAN_SSH_HOME}/health"/*)
+      echo "error: default startup-error file is inside the public health root" >&2
+      exit 1
+      ;;
+  esac
+  test "${DEBIAN_SSH_DEBUG_FILE}" = "${DEBIAN_SSH_LOCAL_DIAG_DIR}/debug.txt"
+  test "${DEBIAN_SSH_STARTUP_ERROR_FILE}" = "${DEBIAN_SSH_LOCAL_DIAG_DIR}/startup-error.txt"
+  test "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}" = "/state/app-data/.enclava/debian-ssh-frp/public"
+  test "${DEBIAN_SSH_PUBLIC_HTTPD_CONF}" = "/state/app-data/.enclava/debian-ssh-frp/httpd/public.httpd.conf"
+  test "${DEBIAN_SSH_LOCAL_DIAG_DIR}" = "/state/app-data/.enclava/debian-ssh-frp/diag"
+)
+
+# Production defaults must pass the lockdown checks. The previous httpd
+# config lived in the parent of config/, so refuse_httpd_conf_dir rejected
+# every default boot. Do not call start_health here: that would create the
+# production directories.
+(
+  unset DEBIAN_SSH_DEBUG_FILE
+  unset DEBIAN_SSH_STARTUP_ERROR_FILE
+  unset DEBIAN_SSH_PUBLIC_HEALTH_DIR
+  unset DEBIAN_SSH_LOCAL_DIAG_DIR
+  unset DEBIAN_SSH_PUBLIC_HTTPD_CONF
+  unset DEBIAN_SSH_PERSISTED_CONFIG_DIR
+  unset DEBIAN_SSH_PERSISTENCE_PATH
+  unset DEBIAN_FRP_STATE_DIR
+  unset DEBIAN_SSH_HOME
+  unset DEBIAN_SSH_CAP_CONFIG_DIRS
+  export DEBIAN_SSH_FRP_ENTRYPOINT_TEST=1
+  # shellcheck source=../deployment-templates/debian-ssh-frp/entrypoint.sh
+  . "${ENTRYPOINT}"
+  refuse_public_health_overlap
+  refuse_httpd_conf_dir
+  refuse_diag_dir
+  test "$(health_publish_parent)" = "/state/app-data/.enclava/debian-ssh-frp"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="/state/app-data/.enclava/debian-ssh-frp/public.httpd.conf"
+  if refuse_httpd_conf_dir; then
+    echo "error: default-parent httpd config directory was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="/state/app-data/.enclava/config/FRP_AUTH_TOKEN"
+  if refuse_httpd_conf_dir; then
+    echo "error: httpd config inside the default CAP config directory was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="/home/user/.enclava/config/DEBIAN_SSH_AUTHORIZED_KEYS"
+  if refuse_httpd_conf_dir; then
+    echo "error: httpd config inside the home CAP config directory was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR=/health
+  test "$(health_publish_parent)" = "/"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR=/health/
+  test "$(health_publish_parent)" = "/"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR=/
+  if health_publish_parent; then
+    echo "error: health root / produced a stage parent" >&2
+    exit 1
+  fi
+)
+if ! /bin/sh -c '
+  set -u
+  export DEBIAN_SSH_FRP_ENTRYPOINT_TEST=1
+  . "$1"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR=/health
+  parent="$(health_publish_parent)" || exit 1
+  [ "$parent" = "/" ] || exit 1
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR=/
+  if health_publish_parent; then
+    exit 1
+  fi
+' sh "${ENTRYPOINT}"; then
+  echo "error: dash health_publish_parent rejected /health" >&2
+  exit 1
+fi
+
+if ! command -v busybox >/dev/null 2>&1; then
+  echo "error: busybox is required to prove diagnostics are not published on the app port" >&2
+  exit 2
+fi
+
+pick_port() {
+  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+}
+reserved_health_port() {
+  case "$1" in
+    2222|7400|8080|18080) return 0 ;;
+  esac
+  return 1
+}
+public_port="$(pick_port)"
+while reserved_health_port "${public_port}"; do
+  public_port="$(pick_port)"
+done
+local_port="$(pick_port)"
+while [[ "${local_port}" == "${public_port}" ]] || reserved_health_port "${local_port}"; do
+  local_port="$(pick_port)"
+done
+
+(
+  export DEBIAN_SSH_FRP_ENTRYPOINT_TEST=1
+  unset DEBIAN_SSH_DEBUG_FILE
+  unset DEBIAN_SSH_STARTUP_ERROR_FILE
+  export DEBIAN_SSH_HOME="${WORKDIR}/http-home"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${WORKDIR}/public-health"
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${WORKDIR}/http-diag"
+  export DEBIAN_HEALTH_PORT="${public_port}"
+  export DEBIAN_HEALTH_LOCAL_PORT="${local_port}"
+  # shellcheck source=../deployment-templates/debian-ssh-frp/entrypoint.sh
+  . "${ENTRYPOINT}"
+  trap 'for pid in "${HEALTH_PID:-}" "${HEALTH_LOCAL_PID:-}"; do [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true; done' EXIT
+
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/nested-diag"
+  if start_health; then
+    echo "error: diagnostic directory inside the public health root was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${WORKDIR}/http-diag"
+  export DEBIAN_SSH_DEBUG_FILE="${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/debug.txt"
+  if start_health; then
+    echo "error: debug file inside the public health root was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_DEBUG_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/debug.txt"
+  export DEBIAN_SSH_STARTUP_ERROR_FILE="${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/startup-error.txt"
+  if start_health; then
+    echo "error: startup-error file inside the public health root was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_DEBUG_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/debug.txt"
+  export DEBIAN_SSH_STARTUP_ERROR_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/startup-error.txt"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${WORKDIR}/httpd-meta/public.httpd.conf"
+  mkdir -p "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}"
+  # Non-canonical paths that still land in the served directory must be refused.
+  export DEBIAN_SSH_DEBUG_FILE="${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/./debug.txt"
+  if start_health; then
+    echo "error: non-canonical debug path inside the public health root was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_DEBUG_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/debug.txt"
+  saved_public="${DEBIAN_SSH_PUBLIC_HEALTH_DIR}"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${DEBIAN_SSH_HOME}/health"
+  if start_health; then
+    echo "error: health root inside the SSH home was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${saved_public}"
+  mkdir -p "${WORKDIR}/outside" "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/sub"
+  ln -s "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/sub" "${WORKDIR}/outside/link"
+  export DEBIAN_SSH_DEBUG_FILE="${WORKDIR}/outside/link/../debug.txt"
+  if start_health; then
+    echo "error: symlink .. path into the public root was accepted" >&2
+    exit 1
+  fi
+  mkdir -p "${DEBIAN_SSH_LOCAL_DIAG_DIR}"
+  ln -sfn "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/leaked.txt" "${DEBIAN_SSH_LOCAL_DIAG_DIR}/via-link"
+  export DEBIAN_SSH_STARTUP_ERROR_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/via-link"
+  if start_health; then
+    echo "error: final symlink into the public root was accepted" >&2
+    exit 1
+  fi
+  if (
+    export DEBIAN_SSH_WRAPPED=1
+    fail "should not follow symlink"
+  ); then
+    echo "error: symlink startup-error write returned success" >&2
+    exit 1
+  fi
+  test ! -e "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/leaked.txt"
+  export DEBIAN_SSH_DEBUG_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/debug.txt"
+  export DEBIAN_SSH_STARTUP_ERROR_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/startup-error.txt"
+
+  # ".." after a missing component is applied by mkdir -p + open. The
+  # uncollapsed string looks outside the docroot; the created file is not.
+  escape_root="${WORKDIR}/escape-root"
+  mkdir -p "${escape_root}/outside" "${escape_root}/public/sub"
+  rm -rf "${escape_root}/outside/missing" "${escape_root}/outside/missing2"
+  ln -s "${escape_root}/public/sub" "${escape_root}/outside/link"
+  saved_escape_public="${DEBIAN_SSH_PUBLIC_HEALTH_DIR}"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${escape_root}/public"
+  export DEBIAN_SSH_DEBUG_FILE="${escape_root}/outside/missing/../../public/debug.txt"
+  export DEBIAN_SSH_STARTUP_ERROR_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/startup-error.txt"
+  if write_debug_snapshot; then
+    echo "error: write_debug_snapshot accepted outside/missing/../../public/debug.txt" >&2
+    exit 1
+  fi
+  if [[ -e "${escape_root}/public/debug.txt" || -e "${escape_root}/public/debug.txt.tmp" ]]; then
+    echo "error: write_debug_snapshot created the public debug file via a missing-component .. path" >&2
+    exit 1
+  fi
+  if start_health; then
+    echo "error: start_health accepted outside/missing/../../public/debug.txt" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_DEBUG_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/debug.txt"
+  export DEBIAN_SSH_STARTUP_ERROR_FILE="${escape_root}/outside/missing2/../../public/startup-error.txt"
+  rm -rf "${escape_root}/outside/missing2"
+  if (
+    export DEBIAN_SSH_WRAPPED=1
+    fail "startup-leaked"
+  ); then
+    echo "error: fail() returned success for outside/missing2/../../public/startup-error.txt" >&2
+    exit 1
+  fi
+  if [[ -e "${escape_root}/public/startup-error.txt" ]]; then
+    echo "error: fail() created the public startup-error file via a missing-component .. path" >&2
+    exit 1
+  fi
+  if start_health; then
+    echo "error: start_health accepted outside/missing2/../../public/startup-error.txt" >&2
+    exit 1
+  fi
+  # ".." that walks back onto an existing symlink is followed by the same open.
+  export DEBIAN_SSH_DEBUG_FILE="${escape_root}/outside/missing/../link/../debug.txt"
+  rm -rf "${escape_root}/outside/missing" "${escape_root}/public/debug.txt"
+  if write_debug_snapshot; then
+    echo "error: write_debug_snapshot accepted outside/missing/../link/../debug.txt" >&2
+    exit 1
+  fi
+  if [[ -e "${escape_root}/public/debug.txt" ]]; then
+    echo "error: write_debug_snapshot created the public debug file via a missing component and a symlink" >&2
+    exit 1
+  fi
+  if ! /bin/sh -c '
+    set -u
+    export DEBIAN_SSH_FRP_ENTRYPOINT_TEST=1
+    export DEBIAN_SSH_PUBLIC_HEALTH_DIR="$1"
+    export DEBIAN_SSH_DEBUG_FILE="$2"
+    export DEBIAN_SSH_STARTUP_ERROR_FILE="$3"
+    . "$4"
+    path_is_inside "$DEBIAN_SSH_DEBUG_FILE" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" || {
+      echo "dash: outside/missing/../../public/debug.txt was not inside" >&2
+      exit 1
+    }
+    path_is_inside "$DEBIAN_SSH_STARTUP_ERROR_FILE" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" || {
+      echo "dash: outside/missing2/../../public/startup-error.txt was not inside" >&2
+      exit 1
+    }
+  ' sh \
+    "${escape_root}/public" \
+    "${escape_root}/outside/missing/../../public/debug.txt" \
+    "${escape_root}/outside/missing2/../../public/startup-error.txt" \
+    "${ENTRYPOINT}"
+  then
+    echo "error: dash did not refuse the missing-component escape" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${saved_escape_public}"
+  export DEBIAN_SSH_DEBUG_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/debug.txt"
+  export DEBIAN_SSH_STARTUP_ERROR_FILE="${DEBIAN_SSH_LOCAL_DIAG_DIR}/startup-error.txt"
+
+  # A health root that contains the SSH home must be refused before any
+  # chmod or delete. Production /home/user is a symlink into app-data.
+  ancestor="${WORKDIR}/state/app-data/home"
+  mkdir -p "${ancestor}/user/.ssh"
+  printf 'hostkey\n' >"${ancestor}/user/.ssh/dropbear_ed25519_host_key"
+  chmod 755 "${ancestor}"
+  ancestor_mode="$(stat -c %a "${ancestor}")"
+  ln -s "${ancestor}/user" "${WORKDIR}/ssh-home-link"
+  saved_overlap_home="${DEBIAN_SSH_HOME}"
+  saved_overlap_public="${DEBIAN_SSH_PUBLIC_HEALTH_DIR}"
+  saved_overlap_config="${DEBIAN_SSH_PERSISTED_CONFIG_DIR}"
+  saved_overlap_persist="${DEBIAN_SSH_PERSISTENCE_PATH}"
+  export DEBIAN_SSH_HOME="${WORKDIR}/ssh-home-link"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${ancestor}"
+  if start_health; then
+    echo "error: health root containing the symlinked SSH home was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${ancestor}/user/.ssh/dropbear_ed25519_host_key")" = "hostkey"
+  test "$(stat -c %a "${ancestor}")" = "${ancestor_mode}"
+  export DEBIAN_SSH_HOME="${ancestor}/user"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${ancestor}"
+  if start_health; then
+    echo "error: health root containing the SSH home was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${ancestor}/user/.ssh/dropbear_ed25519_host_key")" = "hostkey"
+
+  cfg_parent="${WORKDIR}/cfg-parent"
+  mkdir -p "${cfg_parent}/config"
+  printf 'secret-token\n' >"${cfg_parent}/config/FRP_AUTH_TOKEN"
+  export DEBIAN_SSH_HOME="${saved_overlap_home}"
+  export DEBIAN_SSH_PERSISTED_CONFIG_DIR="${cfg_parent}/config"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${cfg_parent}/config"
+  if start_health; then
+    echo "error: health root equal to persisted config was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${cfg_parent}/config/FRP_AUTH_TOKEN")" = "secret-token"
+  mkdir -p "${cfg_parent}/config/public"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${cfg_parent}/config/public"
+  if start_health; then
+    echo "error: health root inside persisted config was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${cfg_parent}/config/FRP_AUTH_TOKEN")" = "secret-token"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${cfg_parent}"
+  if start_health; then
+    echo "error: health root containing persisted config was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${cfg_parent}/config/FRP_AUTH_TOKEN")" = "secret-token"
+
+  mkdir -p "${DEBIAN_FRP_STATE_DIR}"
+  printf 'frp-token\n' >"${DEBIAN_FRP_STATE_DIR}/server_token"
+  export DEBIAN_SSH_PERSISTED_CONFIG_DIR="${saved_overlap_config}"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${DEBIAN_FRP_STATE_DIR}"
+  if start_health; then
+    echo "error: health root equal to FRP state was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${DEBIAN_FRP_STATE_DIR}/server_token")" = "frp-token"
+
+  persist_parent="${WORKDIR}/persist-parent"
+  mkdir -p "${persist_parent}/data"
+  printf 'durable\n' >"${persist_parent}/data/canary"
+  export DEBIAN_SSH_PERSISTENCE_PATH="${persist_parent}/data"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${persist_parent}/data"
+  if start_health; then
+    echo "error: health root equal to the persistence path was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${persist_parent}/data/canary")" = "durable"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${persist_parent}"
+  if start_health; then
+    echo "error: health root containing the persistence path was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${persist_parent}/data/canary")" = "durable"
+  export DEBIAN_SSH_PERSISTENCE_PATH="${saved_overlap_persist}"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${saved_overlap_public}"
+
+  # "/" as a case prefix is "//*", which does not match "/etc". A health
+  # root of / must be refused without chmod or rm. Do not call start_health
+  # on /: a regression would empty the test host.
+  if ! /bin/sh -c '
+    set -u
+    export DEBIAN_SSH_FRP_ENTRYPOINT_TEST=1
+    . "$1"
+    path_is_inside /etc / || {
+      echo "dash: / does not contain /etc" >&2
+      exit 1
+    }
+    if path_is_inside /tmp/a /tmp/b; then
+      echo "dash: /tmp/a was inside /tmp/b" >&2
+      exit 1
+    fi
+  ' sh "${ENTRYPOINT}"; then
+    echo "error: dash path_is_inside / check failed" >&2
+    exit 1
+  fi
+  root_mode="$(stat -c %a /)"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR=/
+  if refuse_public_health_overlap; then
+    echo "error: health root / was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR=//
+  if refuse_public_health_overlap; then
+    echo "error: health root // was accepted" >&2
+    exit 1
+  fi
+  ln -s / "${WORKDIR}/slash-link"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${WORKDIR}/slash-link"
+  if refuse_public_health_overlap; then
+    echo "error: health root symlink to / was accepted" >&2
+    exit 1
+  fi
+  test "$(stat -c %a /)" = "${root_mode}"
+  test "$(resolve_open_path /proc/self/root)" = "/"
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR=/proc/self/root
+  if refuse_public_health_overlap; then
+    echo "error: health root /proc/self/root was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_PUBLIC_HEALTH_DIR="${saved_overlap_public}"
+
+  saved_conf="${DEBIAN_SSH_PUBLIC_HTTPD_CONF}"
+  mkdir -p "${DEBIAN_SSH_HOME}/.ssh"
+  printf 'hostkey\n' >"${DEBIAN_SSH_HOME}/.ssh/conf-canary"
+  chmod 755 "${DEBIAN_SSH_HOME}"
+  home_mode="$(stat -c %a "${DEBIAN_SSH_HOME}")"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${DEBIAN_SSH_HOME}/public.httpd.conf"
+  if start_health; then
+    echo "error: httpd config inside the SSH home was accepted" >&2
+    exit 1
+  fi
+  test "$(stat -c %a "${DEBIAN_SSH_HOME}")" = "${home_mode}"
+  test "$(cat "${DEBIAN_SSH_HOME}/.ssh/conf-canary")" = "hostkey"
+  ln -s "${DEBIAN_SSH_HOME}" "${WORKDIR}/home-conf-link"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${WORKDIR}/home-conf-link/public.httpd.conf"
+  if start_health; then
+    echo "error: httpd config via a symlink to the SSH home was accepted" >&2
+    exit 1
+  fi
+  test "$(stat -c %a "${DEBIAN_SSH_HOME}")" = "${home_mode}"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${saved_conf}"
+
+  saved_ssh_port="${DEBIAN_SSH_PORT}"
+  saved_admin_port="${DEBIAN_FRP_ADMIN_PORT}"
+  export DEBIAN_SSH_PORT="${DEBIAN_HEALTH_LOCAL_PORT}"
+  if start_health; then
+    echo "error: diagnostic port colliding with the SSH port was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_PORT="${saved_ssh_port}"
+  export DEBIAN_FRP_ADMIN_PORT="${DEBIAN_HEALTH_LOCAL_PORT}"
+  if start_health; then
+    echo "error: diagnostic port colliding with the FRP admin port was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_FRP_ADMIN_PORT="${DEBIAN_HEALTH_PORT}"
+  if start_health; then
+    echo "error: public health port colliding with the FRP admin port was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_FRP_ADMIN_PORT="${saved_admin_port}"
+  export DEBIAN_SSH_PORT="${DEBIAN_HEALTH_PORT}"
+  if start_health; then
+    echo "error: public health port colliding with the SSH port was accepted" >&2
+    exit 1
+  fi
+  export DEBIAN_SSH_PORT="${saved_ssh_port}"
+
+  # Diagnostic root must not be chmod'd when it is the SSH home, an ancestor,
+  # persisted config, FRP state, or the persistence path. cgi-bin and
+  # httpd.conf in that tree are customer files.
+  saved_diag="${DEBIAN_SSH_LOCAL_DIAG_DIR}"
+  saved_diag_home="${DEBIAN_SSH_HOME}"
+  saved_diag_cfg="${DEBIAN_SSH_PERSISTED_CONFIG_DIR}"
+  saved_diag_persist="${DEBIAN_SSH_PERSISTENCE_PATH}"
+  mkdir -p "${DEBIAN_SSH_HOME}/cgi-bin"
+  printf 'customer-cgi\n' >"${DEBIAN_SSH_HOME}/cgi-bin/keep"
+  printf 'customer-httpd\n' >"${DEBIAN_SSH_HOME}/httpd.conf"
+  chmod 755 "${DEBIAN_SSH_HOME}"
+  home_mode="$(stat -c %a "${DEBIAN_SSH_HOME}")"
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${DEBIAN_SSH_HOME}"
+  if start_health; then
+    echo "error: diagnostic directory equal to the SSH home was accepted" >&2
+    exit 1
+  fi
+  test "$(stat -c %a "${DEBIAN_SSH_HOME}")" = "${home_mode}"
+  test "$(cat "${DEBIAN_SSH_HOME}/cgi-bin/keep")" = "customer-cgi"
+  test "$(cat "${DEBIAN_SSH_HOME}/httpd.conf")" = "customer-httpd"
+
+  diag_ancestor="${WORKDIR}/diag-ancestor"
+  mkdir -p "${diag_ancestor}/user/.ssh" "${diag_ancestor}/cgi-bin"
+  printf 'hostkey\n' >"${diag_ancestor}/user/.ssh/canary"
+  printf 'keep-cgi\n' >"${diag_ancestor}/cgi-bin/x"
+  printf 'keep-httpd\n' >"${diag_ancestor}/httpd.conf"
+  chmod 755 "${diag_ancestor}"
+  ancestor_mode="$(stat -c %a "${diag_ancestor}")"
+  export DEBIAN_SSH_HOME="${diag_ancestor}/user"
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${diag_ancestor}"
+  if start_health; then
+    echo "error: diagnostic directory containing the SSH home was accepted" >&2
+    exit 1
+  fi
+  test "$(stat -c %a "${diag_ancestor}")" = "${ancestor_mode}"
+  test "$(cat "${diag_ancestor}/user/.ssh/canary")" = "hostkey"
+  test "$(cat "${diag_ancestor}/cgi-bin/x")" = "keep-cgi"
+  test "$(cat "${diag_ancestor}/httpd.conf")" = "keep-httpd"
+  ln -sfn "${diag_ancestor}/user" "${WORKDIR}/diag-home-link"
+  export DEBIAN_SSH_HOME="${WORKDIR}/diag-home-link"
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${diag_ancestor}/user"
+  if start_health; then
+    echo "error: diagnostic directory equal to the resolved SSH home was accepted" >&2
+    exit 1
+  fi
+  test "$(stat -c %a "${diag_ancestor}")" = "${ancestor_mode}"
+  test "$(cat "${diag_ancestor}/httpd.conf")" = "keep-httpd"
+  export DEBIAN_SSH_HOME="${saved_diag_home}"
+
+  mkdir -p "${saved_diag_cfg}"
+  printf 'secret-token\n' >"${saved_diag_cfg}/FRP_AUTH_TOKEN"
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${saved_diag_cfg}"
+  if start_health; then
+    echo "error: diagnostic directory equal to persisted config was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${saved_diag_cfg}/FRP_AUTH_TOKEN")" = "secret-token"
+  cfg_ancestor="${WORKDIR}/cfg-ancestor"
+  mkdir -p "${cfg_ancestor}/config"
+  printf 'secret-token\n' >"${cfg_ancestor}/config/FRP_AUTH_TOKEN"
+  chmod 755 "${cfg_ancestor}"
+  cfg_mode="$(stat -c %a "${cfg_ancestor}")"
+  export DEBIAN_SSH_PERSISTED_CONFIG_DIR="${cfg_ancestor}/config"
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${cfg_ancestor}"
+  if start_health; then
+    echo "error: diagnostic directory containing persisted config was accepted" >&2
+    exit 1
+  fi
+  test "$(stat -c %a "${cfg_ancestor}")" = "${cfg_mode}"
+  test "$(cat "${cfg_ancestor}/config/FRP_AUTH_TOKEN")" = "secret-token"
+
+  mkdir -p "${DEBIAN_FRP_STATE_DIR}"
+  printf 'frp-token\n' >"${DEBIAN_FRP_STATE_DIR}/server_token"
+  export DEBIAN_SSH_PERSISTED_CONFIG_DIR="${saved_diag_cfg}"
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${DEBIAN_FRP_STATE_DIR}"
+  if start_health; then
+    echo "error: diagnostic directory equal to FRP state was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${DEBIAN_FRP_STATE_DIR}/server_token")" = "frp-token"
+
+  persist_dir="${WORKDIR}/persist-diag"
+  mkdir -p "${persist_dir}"
+  printf 'durable\n' >"${persist_dir}/canary"
+  chmod 755 "${persist_dir}"
+  persist_mode="$(stat -c %a "${persist_dir}")"
+  export DEBIAN_SSH_PERSISTENCE_PATH="${persist_dir}"
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${persist_dir}"
+  if start_health; then
+    echo "error: diagnostic directory equal to the persistence path was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${persist_dir}/canary")" = "durable"
+  test "$(stat -c %a "${persist_dir}")" = "${persist_mode}"
+  export DEBIAN_SSH_PERSISTENCE_PATH="${saved_diag_persist}"
+  export DEBIAN_SSH_LOCAL_DIAG_DIR="${saved_diag}"
+
+  # The old default httpd config lived in the parent of persisted config.
+  # Locking that parent down must be refused before chmod.
+  old_parent="${WORKDIR}/old-httpd-parent"
+  mkdir -p "${old_parent}/config"
+  printf 'keep\n' >"${old_parent}/config/FRP_AUTH_TOKEN"
+  chmod 755 "${old_parent}"
+  old_mode="$(stat -c %a "${old_parent}")"
+  saved_httpd="${DEBIAN_SSH_PUBLIC_HTTPD_CONF}"
+  export DEBIAN_SSH_PERSISTED_CONFIG_DIR="${old_parent}/config"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${old_parent}/public.httpd.conf"
+  if start_health; then
+    echo "error: httpd config directory containing persisted config was accepted" >&2
+    exit 1
+  fi
+  test "$(stat -c %a "${old_parent}")" = "${old_mode}"
+  test "$(cat "${old_parent}/config/FRP_AUTH_TOKEN")" = "keep"
+  export DEBIAN_SSH_PERSISTED_CONFIG_DIR="${saved_diag_cfg}"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${saved_httpd}"
+
+  # A conf path inside a CAP config directory must not chmod that directory
+  # or truncate the credential file.
+  cap_dir="${WORKDIR}/cap-config"
+  mkdir -p "${cap_dir}"
+  printf 'live-token\n' >"${cap_dir}/FRP_AUTH_TOKEN"
+  printf 'live-key\n' >"${cap_dir}/DEBIAN_SSH_AUTHORIZED_KEYS"
+  chmod 755 "${cap_dir}"
+  cap_mode="$(stat -c %a "${cap_dir}")"
+  saved_caps="${DEBIAN_SSH_CAP_CONFIG_DIRS}"
+  export DEBIAN_SSH_CAP_CONFIG_DIRS="${cap_dir}"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${cap_dir}/FRP_AUTH_TOKEN"
+  if start_health; then
+    echo "error: httpd config inside a CAP config directory was accepted" >&2
+    exit 1
+  fi
+  test "$(stat -c %a "${cap_dir}")" = "${cap_mode}"
+  test "$(cat "${cap_dir}/FRP_AUTH_TOKEN")" = "live-token"
+  test "$(cat "${cap_dir}/DEBIAN_SSH_AUTHORIZED_KEYS")" = "live-key"
+  cap_parent="${WORKDIR}/cap-parent"
+  mkdir -p "${cap_parent}/config"
+  printf 'live-token\n' >"${cap_parent}/config/FRP_AUTH_TOKEN"
+  chmod 755 "${cap_parent}"
+  cap_parent_mode="$(stat -c %a "${cap_parent}")"
+  export DEBIAN_SSH_CAP_CONFIG_DIRS="${cap_parent}/config"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${cap_parent}/public.httpd.conf"
+  if start_health; then
+    echo "error: httpd config directory containing a CAP config directory was accepted" >&2
+    exit 1
+  fi
+  test "$(stat -c %a "${cap_parent}")" = "${cap_parent_mode}"
+  test "$(cat "${cap_parent}/config/FRP_AUTH_TOKEN")" = "live-token"
+  export DEBIAN_SSH_CAP_CONFIG_DIRS="${saved_caps}"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${saved_httpd}"
+
+  # A conf file in a safe directory can still be a symlink into durable
+  # state. : > would truncate the target. Refuse before that.
+  link_dir="${WORKDIR}/httpd-link-dir"
+  mkdir -p "${link_dir}" "${saved_diag_cfg}" "${DEBIAN_SSH_HOME}/.ssh" "${DEBIAN_FRP_STATE_DIR}"
+  printf 'secret-token\n' >"${saved_diag_cfg}/FRP_AUTH_TOKEN"
+  printf 'hostkey\n' >"${DEBIAN_SSH_HOME}/.ssh/dropbear_ed25519_host_key"
+  printf 'frp-token\n' >"${DEBIAN_FRP_STATE_DIR}/server_token"
+  ln -sfn "${saved_diag_cfg}/FRP_AUTH_TOKEN" "${link_dir}/persist.httpd.conf"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${link_dir}/persist.httpd.conf"
+  if start_health; then
+    echo "error: httpd config symlink into persisted config was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${saved_diag_cfg}/FRP_AUTH_TOKEN")" = "secret-token"
+  ln -sfn "${DEBIAN_SSH_HOME}/.ssh/dropbear_ed25519_host_key" "${link_dir}/host.httpd.conf"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${link_dir}/host.httpd.conf"
+  if start_health; then
+    echo "error: httpd config symlink to the host key was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${DEBIAN_SSH_HOME}/.ssh/dropbear_ed25519_host_key")" = "hostkey"
+  ln -sfn "${DEBIAN_FRP_STATE_DIR}/server_token" "${link_dir}/frp.httpd.conf"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${link_dir}/frp.httpd.conf"
+  if start_health; then
+    echo "error: httpd config symlink into FRP state was accepted" >&2
+    exit 1
+  fi
+  test "$(cat "${DEBIAN_FRP_STATE_DIR}/server_token")" = "frp-token"
+  export DEBIAN_SSH_PUBLIC_HTTPD_CONF="${saved_httpd}"
+
+  cgi_target="${WORKDIR}/customer-cgi-target"
+  mkdir -p "${cgi_target}"
+  printf 'keep\n' >"${cgi_target}/monitor.cgi"
+  ln -s "${cgi_target}" "${WORKDIR}/health-symlink"
+  scrub_former_health_diagnostics "${WORKDIR}/health-symlink"
+  test -L "${WORKDIR}/health-symlink"
+  test "$(cat "${cgi_target}/monitor.cgi")" = "keep"
+
+  mkdir -p "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}"
+  HEALTH_PID="$$"
+  SSHD_PID=""
+  FRPC_PID=""
+  write_debug_snapshot
+  grep -Fq "health_pid=$$" "${DEBIAN_SSH_DEBUG_FILE}"
+  if (
+    export DEBIAN_SSH_WRAPPED=1
+    fail "config did not arrive"
+  ); then
+    echo "error: wrapped diagnostic failure returned success" >&2
+    exit 1
+  fi
+  test "$(cat "${DEBIAN_SSH_STARTUP_ERROR_FILE}")" = "config did not arrive"
+  # Leftovers from the previous image, including a CGI config, must not survive bind.
+  printf 'OLD-DEBUG\n' >"${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/debug.txt"
+  printf 'OLD-STARTUP\n' >"${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/startup-error.txt"
+  printf '%s\n' '#!/bin/sh' 'echo Content-type: text/plain' 'echo' 'echo CGI-RAN' 'id' >"${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/leak.cgi"
+  chmod 755 "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/leak.cgi"
+  printf '%s\n' '*.cgi:/bin/sh' >"${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/httpd.conf"
+  mkdir -p "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/cgi-bin" "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/sub"
+  printf '%s\n' '#!/bin/sh' 'echo Content-type: text/plain' 'echo' 'echo CGI-BIN-RAN' 'id' >"${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/cgi-bin/x"
+  chmod 755 "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/cgi-bin/x"
+  printf '%s\n' '*.cgi:/bin/sh' >"${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/sub/httpd.conf"
+  printf '%s\n' '#!/bin/sh' 'echo Content-type: text/plain' 'echo' 'echo SUBCGI-RAN' 'id' >"${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/sub/y.cgi"
+  chmod 755 "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/sub/y.cgi"
+  mkdir -p "${DEBIAN_SSH_HOME}/health"
+  printf 'OLD-HOME-DEBUG\n' >"${DEBIAN_SSH_HOME}/health/debug.txt"
+  printf '#!/bin/sh\necho customer\n' >"${DEBIAN_SSH_HOME}/health/monitor.cgi"
+  printf 'customer-httpd\n' >"${DEBIAN_SSH_HOME}/health/httpd.conf"
+
+  start_health
+  test ! -e "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/debug.txt"
+  test ! -e "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/startup-error.txt"
+  test ! -e "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/leak.cgi"
+  test ! -e "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/httpd.conf"
+  test ! -e "${DEBIAN_SSH_HOME}/health/debug.txt"
+  test -f "${DEBIAN_SSH_HOME}/health/monitor.cgi"
+  test "$(cat "${DEBIAN_SSH_HOME}/health/httpd.conf")" = "customer-httpd"
+  test ! -d "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/cgi-bin"
+  test ! -e "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/sub/y.cgi"
+  publish_ready
+  test "$(cat "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/healthz")" = "ok"
+  test "$(cat "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/ssh.txt")" = "ssh -p 22001 user@relay.enclava.me"
+  test "$(cat "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}/frp-url.txt")" = "tcp://relay.enclava.me:22001"
+  published_names="$(cd "${DEBIAN_SSH_PUBLIC_HEALTH_DIR}" && find . -mindepth 1 -print | sed 's|^\./||' | sort | tr '\n' ' ')"
+  test "${published_names}" = "frp-url.txt healthz ssh.txt "
+  python3 - "${public_port}" "${local_port}" <<'PY'
+import sys
+import time
+import urllib.error
+import urllib.request
+
+public, local = sys.argv[1], sys.argv[2]
+
+def get(url):
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+    except Exception as exc:
+        return None, str(exc).encode()
+
+def wait_ok(url, needle):
+    last = None
+    for _ in range(50):
+        status, body = get(url)
+        last = (status, body)
+        if status == 200 and needle in body:
+            return body
+        time.sleep(0.05)
+    raise SystemExit(f"timeout waiting for {url}: {last!r}")
+
+wait_ok(f"http://127.0.0.1:{public}/healthz", b"ok\n")
+status, body = get(f"http://127.0.0.1:{public}/ssh.txt")
+if status != 200 or b"ssh -p 22001" not in body:
+    raise SystemExit(f"public ssh.txt missing: {status} {body!r}")
+status, body = get(f"http://127.0.0.1:{public}/frp-url.txt")
+if status != 200 or b"tcp://relay.enclava.me:22001" not in body:
+    raise SystemExit(f"public frp-url.txt missing: {status} {body!r}")
+for path in ("/debug.txt", "/startup-error.txt", "/leak.cgi", "/cgi-bin/x", "/sub/y.cgi", "/ssh.txt.tmp", "/frp-url.txt.tmp", "/healthz.tmp"):
+    status, body = get(f"http://127.0.0.1:{public}{path}")
+    if status != 404 or b"OLD-DEBUG" in body or b"OLD-STARTUP" in body or b"uid=" in body or b"health_pid" in body:
+        raise SystemExit(f"public port published {path}: {status} {body!r}")
+wait_ok(f"http://127.0.0.1:{local}/debug.txt", b"health_pid")
+status, body = get(f"http://127.0.0.1:{local}/startup-error.txt")
+if status != 200 or body != b"config did not arrive\n":
+    raise SystemExit(f"loopback startup-error missing: {status} {body!r}")
+PY
+
+  local_hex="$(printf '%04X' "${local_port}")"
+  awk -v port=":${local_hex}" '$2 ~ port "$" { print $2 }' /proc/net/tcp >"${WORKDIR}/local-binds.txt"
+  grep -qx "0100007F:${local_hex}" "${WORKDIR}/local-binds.txt"
+  if grep -qx "00000000:${local_hex}" "${WORKDIR}/local-binds.txt"; then
+    echo "error: diagnostic listener is bound on 0.0.0.0" >&2
+    exit 1
+  fi
+  if [[ -r /proc/net/tcp6 ]]; then
+    awk -v port=":${local_hex}" '$2 ~ port "$" { print $2 }' /proc/net/tcp6 >"${WORKDIR}/local-binds6.txt"
+    if grep -q . "${WORKDIR}/local-binds6.txt"; then
+      echo "error: diagnostic listener has an IPv6 socket" >&2
+      exit 1
+    fi
+  fi
+  public_hex="$(printf '%04X' "${public_port}")"
+  awk -v port=":${public_hex}" '$2 ~ port "$" { print $2 }' /proc/net/tcp >"${WORKDIR}/public-binds.txt"
+  grep -qx "00000000:${public_hex}" "${WORKDIR}/public-binds.txt"
+)
 
 echo "Debian SSH FRP entrypoint tests passed"

@@ -6,11 +6,52 @@ PaaS injects the FRP relay address, bootstrap token, proxy name, remote port,
 and per-instance tunnel credential through the CAP confidential config-token
 path. Customers provide only `DEBIAN_SSH_AUTHORIZED_KEYS`.
 
-The template publishes:
+The workload user has passwordless sudo, so root-only file modes do not hide
+FRP material from the tenant. The shared bootstrap token remains the relay
+login gate (`frps` `auth.token`); this image cannot replace it with a
+per-deployment token without a relay change. Tunnel open must be authorized
+by the per-instance credential.
+The entrypoint hardcodes TLS on and allowlists every value it interpolates
+into `frpc.toml` or the admin curl config, so a delivered
+`FRP_TLS_ENABLE=false` or a quote/newline in an interpolated field fails closed
+instead of injecting another `[[proxies]]` table. The login token is not
+interpolated: it is written to a file referenced by `auth.tokenSource.file.path`
+and keeps the server contract (any non-whitespace token, including quotes and
+backslashes).
+
+The template publishes only:
 
 - `/healthz`
 - `/ssh.txt`
 - `/frp-url.txt`
+
+Those files are written under `/state/app-data/.enclava/debian-ssh-frp/public`
+(root, mode 0700), not under `$HOME/health`. `debug.txt` and
+`startup-error.txt` are not on that port. They are written under
+`/state/app-data/.enclava/debian-ssh-frp/diag/` (mode 0700, root) and are
+also served on `127.0.0.1:${DEBIAN_HEALTH_LOCAL_PORT}` (default 18080).
+CAP publishes the app port (`8080`), not the loopback diagnostic port.
+On start the public directory is emptied and recreated root-owned, so a
+leftover `cgi-bin` script, nested `httpd.conf`, or symlink cannot stay on
+port 8080. A health root of `/`, or one that overlaps the SSH home, persisted
+config, FRP state, a CAP config directory, or the persistence root, is
+refused before that directory is chmod'd or emptied. Readiness files are
+written in a fresh private directory beside the served directory, on the
+same filesystem, and renamed in. An existing sibling is not reused or
+chmod'd, and the stage directory is removed after the rename. A public
+root such as `/health` stages under `/`.
+`$HOME/health` is no longer served; startup removes only the previous
+image's `debug.txt` and `startup-error.txt` there, not customer scripts.
+A diagnostic directory that overlaps the SSH home, persisted config, FRP
+state, a CAP config directory, or that contains the persistence root, is
+refused before it is chmod'd.
+Neither health port may equal `DEBIAN_SSH_PORT` or `DEBIAN_FRP_ADMIN_PORT`.
+The listeners are given an empty root-owned `-c` config so a top-level
+docroot `httpd.conf` is not loaded. That file defaults to
+`/state/app-data/.enclava/debian-ssh-frp/httpd/public.httpd.conf`, whose
+directory does not contain `config`, `diag`, or `public`. A config
+directory that would cover those trees, the SSH home, FRP state, or a
+CAP config directory is refused before it is chmod'd.
 
 `frpc` must authenticate `Login`, `HeartBeats`, and `NewWorkConns`; the entrypoint
 therefore renders `auth.additionalScopes = ["HeartBeats", "NewWorkConns"]`.

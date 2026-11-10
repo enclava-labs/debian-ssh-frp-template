@@ -7,6 +7,10 @@ set -u
 : "${DEBIAN_SSH_HOME:=/home/user}"
 : "${DEBIAN_SSH_PORT:=2222}"
 : "${DEBIAN_HEALTH_PORT:=8080}"
+: "${DEBIAN_HEALTH_LOCAL_PORT:=18080}"
+: "${DEBIAN_SSH_PUBLIC_HEALTH_DIR:=/state/app-data/.enclava/debian-ssh-frp/public}"
+: "${DEBIAN_SSH_PUBLIC_HTTPD_CONF:=/state/app-data/.enclava/debian-ssh-frp/httpd/public.httpd.conf}"
+: "${DEBIAN_SSH_LOCAL_DIAG_DIR:=/state/app-data/.enclava/debian-ssh-frp/diag}"
 : "${DEBIAN_SSH_RESTART_WRAPPER:=0}"
 : "${DEBIAN_SSH_WRAPPED:=0}"
 : "${DEBIAN_SSH_RESTART_DELAY_SECONDS:=2}"
@@ -21,7 +25,8 @@ set -u
 : "${DEBIAN_SSH_HOST_KEY:=$DEBIAN_SSH_HOME/.ssh/dropbear_ed25519_host_key}"
 : "${DEBIAN_SSH_READY_KEY:=$DEBIAN_SSH_HOME/.ssh/ssh_ready_ed25519_key}"
 : "${DEBIAN_SSH_PID_FILE:=$DEBIAN_SSH_HOME/.ssh/ssh_daemon.pid}"
-: "${DEBIAN_SSH_DEBUG_FILE:=$DEBIAN_SSH_HOME/health/debug.txt}"
+: "${DEBIAN_SSH_DEBUG_FILE:=$DEBIAN_SSH_LOCAL_DIAG_DIR/debug.txt}"
+: "${DEBIAN_SSH_STARTUP_ERROR_FILE:=$DEBIAN_SSH_LOCAL_DIAG_DIR/startup-error.txt}"
 : "${DEBIAN_FRP_STATE_DIR:=/state/app-data/.enclava/frp}"
 : "${DEBIAN_FRP_CONFIG_FILE:=$DEBIAN_FRP_STATE_DIR/frpc.toml}"
 : "${DEBIAN_FRP_TOKEN_FILE:=$DEBIAN_FRP_STATE_DIR/server_token}"
@@ -133,6 +138,11 @@ prepare_secret_dir() {
     fi
     mkdir -p "$dir" || return 1
     [ ! -L "$dir" ] || return 1
+    canon="$(cd -P "$dir" && pwd)" || return 1
+    if [ "$canon" = "/" ]; then
+        echo "refusing to lock down /" >&2
+        return 1
+    fi
     chown_if_root 0:0 "$dir" || return 1
     chmod 700 "$dir" || return 1
 }
@@ -191,6 +201,10 @@ write_config_wait_snapshot() {
     reason="$1"
     elapsed="${2:-}"
     [ -n "$DEBIAN_SSH_DEBUG_FILE" ] || return 0
+    if published_path "$DEBIAN_SSH_DEBUG_FILE" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR"; then
+        echo "refusing to publish debug snapshot on the public health port" >&2
+        return 1
+    fi
     mkdir -p "${DEBIAN_SSH_DEBUG_FILE%/*}" 2>/dev/null || return 0
     tmp="${DEBIAN_SSH_DEBUG_FILE}.tmp.$$"
     {
@@ -268,7 +282,11 @@ write_config_wait_snapshot() {
         rm -f "$tmp" 2>/dev/null || true
         return 0
     }
-    mv "$tmp" "$DEBIAN_SSH_DEBUG_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    mv "$tmp" "$DEBIAN_SSH_DEBUG_FILE" 2>/dev/null || {
+        rm -f "$tmp" 2>/dev/null || true
+        return 0
+    }
+    chmod 600 "$DEBIAN_SSH_DEBUG_FILE" 2>/dev/null || true
 }
 
 ready_config_dirs() {
@@ -408,13 +426,115 @@ require_nonempty_env() {
     }
 }
 
+reject_multiline() {
+    key="$1"
+    value="$2"
+    oneline="$(printf '%s' "$value" | tr -d '\n\r')"
+    [ "$oneline" = "$value" ] || {
+        echo "$key must be a single line" >&2
+        return 1
+    }
+}
+
 validate_host() {
     key="$1"
     value="$2"
+    reject_multiline "$key" "$value" || return 1
     printf '%s\n' "$value" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$' || {
         echo "$key must be a DNS host" >&2
         return 1
     }
+}
+
+validate_exact() {
+    key="$1"
+    value="$2"
+    expected="$3"
+    [ "$value" = "$expected" ] || {
+        echo "$key must be ${expected}" >&2
+        return 1
+    }
+}
+
+validate_toml_token() {
+    key="$1"
+    value="$2"
+    max="$3"
+    reject_multiline "$key" "$value" || return 1
+    printf '%s\n' "$value" | grep -Eq "^[A-Za-z0-9_-]{1,${max}}$" || {
+        echo "$key must be a single safe token" >&2
+        return 1
+    }
+}
+
+validate_optional_toml_token() {
+    key="$1"
+    value="$2"
+    max="$3"
+    [ -n "$value" ] || return 0
+    validate_toml_token "$key" "$value" "$max"
+}
+
+validate_secret_path() {
+    key="$1"
+    value="$2"
+    reject_multiline "$key" "$value" || return 1
+    printf '%s\n' "$value" | grep -Eq '^/[A-Za-z0-9_./-]{1,240}$' || {
+        echo "$key must be a safe absolute path" >&2
+        return 1
+    }
+    # Reject a ".." path segment only. ".enclava" is one dot and must stay legal.
+    case "$value" in
+        *"/.."*|*"../"*|*/..|../*|..)
+            echo "$key must not contain .." >&2
+            return 1
+            ;;
+    esac
+}
+
+validate_frp_login_token() {
+    key="$1"
+    value="$2"
+    [ -n "$value" ] || {
+        echo "$key is required" >&2
+        return 1
+    }
+    bytes="$(printf '%s' "$value" | wc -c | tr -d ' ')"
+    [ "$bytes" -le 4096 ] || {
+        echo "$key is too long" >&2
+        return 1
+    }
+    # Match frp::validate_single_token: non-empty, at most 4096 bytes, no
+    # whitespace, not a placeholder. Quotes and backslashes stay legal.
+    # The token is written to a file and only that path is interpolated into
+    # frpc.toml, so those bytes cannot close a TOML string. Rejecting them
+    # would fail startup for tokens the control plane already accepts.
+    # Other non-whitespace bytes (including base64 +/=) stay legal: the
+    # operator-chosen login token is not a generated charset.
+    compact="$(printf '%s' "$value" | tr -d '[:space:]')"
+    [ "$compact" = "$value" ] || {
+        echo "$key must be a single token without whitespace" >&2
+        return 1
+    }
+    upper="$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')"
+    case "$upper" in
+        *REDACTED*|*REPLACE_WITH*|*PLACEHOLDER*)
+            echo "$key must not be a placeholder" >&2
+            return 1
+            ;;
+    esac
+}
+
+validate_tls_forced() {
+    # Hardcoded on below. A delivered false must fail closed, not connect
+    # in cleartext and not be silently ignored.
+    case "${FRP_TLS_ENABLE-}" in
+        ""|true) ;;
+        *)
+            echo "FRP_TLS_ENABLE must be unset or true; TLS cannot be disabled" >&2
+            return 1
+            ;;
+    esac
 }
 
 validate_authorized_key_algorithm() {
@@ -582,6 +702,12 @@ ensure_dropbear_host_key() {
 prepare_home() {
     mkdir -p /state/app-data/home/user || return 1
     mkdir -p "$DEBIAN_SSH_HOME/.ssh" "$DEBIAN_SSH_HOME/health" "$DEBIAN_FRP_STATE_DIR" || return 1
+    # Refuse before chmod. An ancestor of the SSH home, or the persisted
+    # config directory, would otherwise be mode 0700 and later emptied.
+    refuse_public_health_overlap || return 1
+    refuse_diag_dir || return 1
+    prepare_secret_dir "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" || return 1
+    prepare_secret_dir "$DEBIAN_SSH_LOCAL_DIAG_DIR" || return 1
     chown_if_root -R "$DEBIAN_SSH_UID:$DEBIAN_SSH_GID" "$DEBIAN_SSH_HOME/." || return 1
     chmod 700 "$DEBIAN_SSH_HOME" "$DEBIAN_SSH_HOME/.ssh" || return 1
     prepare_secret_dir "$DEBIAN_FRP_STATE_DIR" || return 1
@@ -619,6 +745,21 @@ prepare_ssh_ready_key() {
     chown_if_root "$DEBIAN_SSH_UID:$DEBIAN_SSH_GID" "$DEBIAN_SSH_HOME/.ssh/authorized_keys" || return 1
 }
 
+# CAP-delivered values are not trusted. load_cap_config exports every file in
+# a ready config dir, so a poisoned delivery can set any of these keys. Every
+# quoted field is allowlisted before interpolation: a quote or newline would
+# close the string and inject another [[proxies]] table. TLS, proxy type, and
+# localIP are hardcoded after an exact check so the delivered bytes are not
+# what gets written. The login token is not one of those fields: it is written
+# to a file and only the path is quoted, so it follows the server token
+# contract, quotes and backslashes included.
+#
+# The shared bootstrap token is still written. frps auth.token is that login
+# gate, so dropping it here would break the relay. Passwordless sudo is the
+# workload profile and can read this root-only file; mode 600 does not hide
+# it. The relay authorizer must reject a login that presents only this token.
+# Making the in-guest token per-deployment requires a relay change and is not
+# done here.
 render_frpc_config() {
     validate_host FRP_SERVER_ADDR "$FRP_SERVER_ADDR" || return 1
     validate_host FRP_PUBLIC_HOST "$FRP_PUBLIC_HOST" || return 1
@@ -626,6 +767,17 @@ render_frpc_config() {
     validate_uint FRP_REMOTE_PORT "$FRP_REMOTE_PORT" || return 1
     validate_uint FRP_LOCAL_PORT "$FRP_LOCAL_PORT" || return 1
     validate_uint DEBIAN_FRP_ADMIN_PORT "$DEBIAN_FRP_ADMIN_PORT" || return 1
+    validate_exact FRP_PROXY_TYPE "$FRP_PROXY_TYPE" tcp || return 1
+    validate_exact FRP_LOCAL_ADDR "$FRP_LOCAL_ADDR" 127.0.0.1 || return 1
+    validate_toml_token FRP_PROXY_NAME "$FRP_PROXY_NAME" 128 || return 1
+    validate_toml_token FRP_TUNNEL_CREDENTIAL_ID "$FRP_TUNNEL_CREDENTIAL_ID" 160 || return 1
+    validate_toml_token FRP_TUNNEL_SECRET "$FRP_TUNNEL_SECRET" 256 || return 1
+    validate_optional_toml_token ENCLAVA_ORG_ID "${ENCLAVA_ORG_ID:-}" 128 || return 1
+    validate_optional_toml_token ENCLAVA_APP_ID "${ENCLAVA_APP_ID:-}" 128 || return 1
+    validate_optional_toml_token ENCLAVA_DEPLOYMENT_ID "${ENCLAVA_DEPLOYMENT_ID:-}" 128 || return 1
+    validate_secret_path DEBIAN_FRP_TOKEN_FILE "$DEBIAN_FRP_TOKEN_FILE" || return 1
+    validate_frp_login_token FRP_AUTH_TOKEN "$FRP_AUTH_TOKEN" || return 1
+    validate_tls_forced || return 1
     write_root_secret_file "$DEBIAN_FRP_TOKEN_FILE" "$FRP_AUTH_TOKEN" || return 1
     write_root_secret_file "$DEBIAN_FRP_ADMIN_CURL_CONFIG" "user = \"enclava:${FRP_TUNNEL_SECRET}\"" || return 1
     config_dir="${DEBIAN_FRP_CONFIG_FILE%/*}"
@@ -636,7 +788,7 @@ render_frpc_config() {
     (umask 077 && cat >"$tmp" <<EOF
 serverAddr = "${FRP_SERVER_ADDR}"
 serverPort = ${FRP_SERVER_PORT}
-transport.tls.enable = ${FRP_TLS_ENABLE:-true}
+transport.tls.enable = true
 auth.method = "token"
 auth.tokenSource.type = "file"
 auth.tokenSource.file.path = "${DEBIAN_FRP_TOKEN_FILE}"
@@ -654,8 +806,8 @@ metadatas.enclava_deployment_id = "${ENCLAVA_DEPLOYMENT_ID:-}"
 
 [[proxies]]
 name = "${FRP_PROXY_NAME}"
-type = "${FRP_PROXY_TYPE}"
-localIP = "${FRP_LOCAL_ADDR}"
+type = "tcp"
+localIP = "127.0.0.1"
 localPort = ${FRP_LOCAL_PORT}
 remotePort = ${FRP_REMOTE_PORT}
 EOF
@@ -663,6 +815,16 @@ EOF
         rm -f "$tmp" 2>/dev/null || true
         return 1
     }
+    if ! grep -qx 'transport.tls.enable = true' "$tmp"; then
+        echo "frpc config did not hardcode TLS on" >&2
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    if [ "$(grep -c '^\[\[proxies\]\]$' "$tmp")" != "1" ]; then
+        echo "frpc config must contain exactly one proxy table" >&2
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
     chown_if_root 0:0 "$tmp" || {
         rm -f "$tmp" 2>/dev/null || true
         return 1
@@ -674,9 +836,432 @@ EOF
     mv -f "$tmp" "$DEBIAN_FRP_CONFIG_FILE"
 }
 
+# Resolve the path mkdir -p + open will use: walk left to right, follow
+# directory symlinks with pwd -P before applying "..", and follow a final
+# symlink. A lexical collapse of ".." first misses outside/link/../file when
+# link points into the served directory. ".." after a missing component is
+# still applied: mkdir -p creates that component, and the following open
+# uses it. Stopping at the missing component and appending the rest as text
+# judges outside/missing/../../public/file outside the docroot, then the
+# writer creates public/file.
+resolve_open_path() {
+    raw="$1"
+    [ -n "$raw" ] || return 1
+    RESOLVE_HOPS=$((${RESOLVE_HOPS:-0} + 1))
+    [ "$RESOLVE_HOPS" -lt 40 ] || return 1
+    case "$raw" in
+        /*) ;;
+        *) raw="$(pwd)/$raw" ;;
+    esac
+    while [ "$raw" != "/" ] && [ "${raw%/}" != "$raw" ]; do
+        raw="${raw%/}"
+    done
+    current="/"
+    rest="${raw#/}"
+    while [ -n "$rest" ]; do
+        part="${rest%%/*}"
+        case "$rest" in
+            */*) rest="${rest#*/}" ;;
+            *) rest="" ;;
+        esac
+        [ -n "$part" ] && [ "$part" != "." ] || continue
+        if [ "$part" = ".." ]; then
+            [ "$current" = "/" ] || current="${current%/*}"
+            [ -n "$current" ] || current="/"
+            continue
+        fi
+        if [ "$current" = "/" ]; then
+            next="/$part"
+        else
+            next="$current/$part"
+        fi
+        if [ -L "$next" ] && [ ! -d "$next" ]; then
+            [ -z "$rest" ] || return 1
+            target="$(readlink "$next")" || return 1
+            case "$target" in
+                /*) resolve_open_path "$target" ;;
+                *) resolve_open_path "$current/$target" ;;
+            esac
+            return $?
+        fi
+        if [ -d "$next" ]; then
+            # cd in this shell, not a subshell. "$(cd -P /proc/self && pwd)"
+            # records the subshell's pid, which is gone before the next
+            # component is checked, so /proc/self/root never resolves to /.
+            old_pwd="$(pwd -P)" || return 1
+            cd -P "$next" || return 1
+            current="$(pwd -P)" || {
+                cd "$old_pwd" 2>/dev/null || true
+                return 1
+            }
+            cd "$old_pwd" || return 1
+            continue
+        fi
+        # Missing, or not a directory. Keep walking so a later ".." is
+        # applied against this component. If ".." returns to an existing
+        # directory, the next iteration resolves symlinks again.
+        current="$next"
+    done
+    if [ -L "$current" ]; then
+        target="$(readlink "$current")" || return 1
+        case "$target" in
+            /*) resolve_open_path "$target" ;;
+            *) resolve_open_path "${current%/*}/$target" ;;
+        esac
+        return $?
+    fi
+    printf '%s\n' "$current"
+}
+
+# 0 = inside, 1 = outside, 2 = could not resolve. Callers that refuse a
+# publication must treat 2 as refuse. Callers that skip a lockdown must not.
+path_is_inside() {
+    RESOLVE_HOPS=0
+    child="$(resolve_open_path "$1")" || return 2
+    RESOLVE_HOPS=0
+    parent="$(resolve_open_path "$2")" || return 2
+    [ -n "$child" ] && [ -n "$parent" ] || return 2
+    # "/" as a case prefix becomes "//*", which does not match "/etc".
+    # The filesystem root contains every absolute path.
+    if [ "$parent" = "/" ]; then
+        return 0
+    fi
+    case "$child" in
+        "$parent"|"$parent"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# True when the path is inside the parent or cannot be resolved.
+published_path() {
+    path_is_inside "$1" "$2"
+    [ "$?" -ne 1 ]
+}
+
+# True when either path contains the other (including equality) or either
+# cannot be resolved. Empty "other" is not an overlap.
+health_root_overlaps() {
+    other="$1"
+    [ -n "$other" ] || return 1
+    [ -n "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" ] || return 0
+    published_path "$other" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" \
+        || published_path "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" "$other"
+}
+
+# The public root is emptied and chmod'd on start. It must not contain, or
+# sit inside, durable state. The persistence root normally contains the
+# public directory; only refuse when emptying the public root would delete
+# that persistence root.
+refuse_public_health_overlap() {
+    [ -n "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" ] || return 1
+    RESOLVE_HOPS=0
+    resolved_public="$(resolve_open_path "$DEBIAN_SSH_PUBLIC_HEALTH_DIR")" || {
+        echo "public health root could not be resolved" >&2
+        return 1
+    }
+    # path_is_inside treats "/" as a parent of everything, but do not rely on
+    # that alone: emptying or chmod'ing "/" destroys the guest.
+    if [ "$resolved_public" = "/" ]; then
+        echo "refusing to serve / as the public health root" >&2
+        return 1
+    fi
+    if health_root_overlaps "$DEBIAN_SSH_HOME"; then
+        echo "refusing to serve a health root that overlaps the SSH home" >&2
+        return 1
+    fi
+    if health_root_overlaps "$DEBIAN_SSH_LOCAL_DIAG_DIR"; then
+        echo "diagnostic directory must not overlap the public health root" >&2
+        return 1
+    fi
+    if health_root_overlaps "$DEBIAN_SSH_PERSISTED_CONFIG_DIR"; then
+        echo "public health root must not overlap persisted config" >&2
+        return 1
+    fi
+    if health_root_overlaps "$DEBIAN_FRP_STATE_DIR"; then
+        echo "public health root must not overlap FRP state" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PERSISTENCE_PATH:-}" ] \
+        && published_path "$DEBIAN_SSH_PERSISTENCE_PATH" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR"; then
+        echo "public health root must not contain the persistence path" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PUBLIC_HTTPD_CONF:-}" ] \
+        && published_path "$DEBIAN_SSH_PUBLIC_HTTPD_CONF" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR"; then
+        echo "httpd config must not live in the public health root" >&2
+        return 1
+    fi
+    if published_path "$DEBIAN_SSH_DEBUG_FILE" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" \
+        || published_path "$DEBIAN_SSH_STARTUP_ERROR_FILE" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR"; then
+        echo "diagnostic files must not be published on the public health port" >&2
+        return 1
+    fi
+    for cap_dir in $DEBIAN_SSH_CAP_CONFIG_DIRS; do
+        if health_root_overlaps "$cap_dir"; then
+            echo "public health root must not overlap a CAP config directory" >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+refuse_health_ports() {
+    [ -n "$DEBIAN_HEALTH_PORT" ] || return 1
+    [ -n "$DEBIAN_HEALTH_LOCAL_PORT" ] || return 1
+    if [ "$DEBIAN_HEALTH_PORT" = "$DEBIAN_HEALTH_LOCAL_PORT" ]; then
+        echo "local diagnostic port must not be the public health port" >&2
+        return 1
+    fi
+    if [ "$DEBIAN_HEALTH_PORT" = "${DEBIAN_SSH_PORT:-}" ] \
+        || [ "$DEBIAN_HEALTH_LOCAL_PORT" = "${DEBIAN_SSH_PORT:-}" ]; then
+        echo "health port must not collide with the SSH port" >&2
+        return 1
+    fi
+    if [ "$DEBIAN_HEALTH_PORT" = "${DEBIAN_FRP_ADMIN_PORT:-}" ] \
+        || [ "$DEBIAN_HEALTH_LOCAL_PORT" = "${DEBIAN_FRP_ADMIN_PORT:-}" ]; then
+        echo "health port must not collide with the FRP admin port" >&2
+        return 1
+    fi
+    return 0
+}
+
+# prepare_secret_dir chmod 0700s the httpd config's parent. That parent must
+# not be the SSH home, persisted config, or another durable directory.
+refuse_httpd_conf_dir() {
+    conf="${DEBIAN_SSH_PUBLIC_HTTPD_CONF:-}"
+    [ -n "$conf" ] || return 1
+    conf_dir="${conf%/*}"
+    [ "$conf_dir" != "$conf" ] || return 0
+    RESOLVE_HOPS=0
+    resolved_conf="$(resolve_open_path "$conf_dir")" || {
+        echo "httpd config directory could not be resolved" >&2
+        return 1
+    }
+    if [ "$resolved_conf" = "/" ]; then
+        echo "refusing to lock down / for the httpd config" >&2
+        return 1
+    fi
+    if published_path "$conf_dir" "$DEBIAN_SSH_HOME" \
+        || published_path "$DEBIAN_SSH_HOME" "$conf_dir"; then
+        echo "httpd config directory must not overlap the SSH home" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PERSISTED_CONFIG_DIR:-}" ] && published_path "$conf_dir" "$DEBIAN_SSH_PERSISTED_CONFIG_DIR"; then
+        echo "httpd config directory must not overlap persisted config" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PERSISTED_CONFIG_DIR:-}" ] && published_path "$DEBIAN_SSH_PERSISTED_CONFIG_DIR" "$conf_dir"; then
+        echo "httpd config directory must not overlap persisted config" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_FRP_STATE_DIR:-}" ] && published_path "$conf_dir" "$DEBIAN_FRP_STATE_DIR"; then
+        echo "httpd config directory must not overlap FRP state" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_FRP_STATE_DIR:-}" ] && published_path "$DEBIAN_FRP_STATE_DIR" "$conf_dir"; then
+        echo "httpd config directory must not overlap FRP state" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PERSISTENCE_PATH:-}" ] \
+        && published_path "$DEBIAN_SSH_PERSISTENCE_PATH" "$conf_dir"; then
+        echo "httpd config directory must not contain the persistence path" >&2
+        return 1
+    fi
+    # The default used to live in the parent of config, diag, and public.
+    # chmod 0700 on that parent covers those trees. Refuse that layout.
+    if [ -n "${DEBIAN_SSH_LOCAL_DIAG_DIR:-}" ] \
+        && published_path "$DEBIAN_SSH_LOCAL_DIAG_DIR" "$conf_dir"; then
+        echo "httpd config directory must not contain the diagnostic directory" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_LOCAL_DIAG_DIR:-}" ] \
+        && published_path "$conf_dir" "$DEBIAN_SSH_LOCAL_DIAG_DIR"; then
+        echo "httpd config directory must not sit inside the diagnostic directory" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PUBLIC_HEALTH_DIR:-}" ] \
+        && published_path "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" "$conf_dir"; then
+        echo "httpd config directory must not contain the public health root" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PUBLIC_HEALTH_DIR:-}" ] \
+        && published_path "$conf_dir" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR"; then
+        echo "httpd config directory must not sit inside the public health root" >&2
+        return 1
+    fi
+    # : > follows a symlink. A conf file whose directory is outside a durable
+    # tree can still point at a credential inside it. Resolve the file too.
+    if published_path "$conf" "$DEBIAN_SSH_HOME"; then
+        echo "httpd config must not overlap the SSH home" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PERSISTED_CONFIG_DIR:-}" ] \
+        && published_path "$conf" "$DEBIAN_SSH_PERSISTED_CONFIG_DIR"; then
+        echo "httpd config must not overlap persisted config" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_FRP_STATE_DIR:-}" ] \
+        && published_path "$conf" "$DEBIAN_FRP_STATE_DIR"; then
+        echo "httpd config must not overlap FRP state" >&2
+        return 1
+    fi
+    # A conf path inside a CAP config directory is truncated by `: >` after
+    # prepare_secret_dir chmod 0700s that directory. An ancestor conf
+    # directory would lock the CAP tree down the same way.
+    for cap_dir in $DEBIAN_SSH_CAP_CONFIG_DIRS; do
+        if published_path "$conf" "$cap_dir" \
+            || published_path "$cap_dir" "$conf" \
+            || published_path "$conf_dir" "$cap_dir" \
+            || published_path "$cap_dir" "$conf_dir"; then
+            echo "httpd config must not overlap a CAP config directory" >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+# prepare_secret_dir chmod 0700s the diagnostic root, and startup deletes
+# cgi-bin and httpd.conf there. That root must not be, contain, or sit
+# inside durable state. The persistence root normally contains the
+# diagnostic directory; only refuse when locking it down would cover the
+# persistence root itself.
+refuse_diag_dir() {
+    diag="${DEBIAN_SSH_LOCAL_DIAG_DIR:-}"
+    [ -n "$diag" ] || return 1
+    RESOLVE_HOPS=0
+    resolved_diag="$(resolve_open_path "$diag")" || {
+        echo "diagnostic directory could not be resolved" >&2
+        return 1
+    }
+    if [ "$resolved_diag" = "/" ]; then
+        echo "refusing to lock down / for diagnostics" >&2
+        return 1
+    fi
+    if published_path "$diag" "$DEBIAN_SSH_HOME" \
+        || published_path "$DEBIAN_SSH_HOME" "$diag"; then
+        echo "diagnostic directory must not overlap the SSH home" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PERSISTED_CONFIG_DIR:-}" ] \
+        && published_path "$diag" "$DEBIAN_SSH_PERSISTED_CONFIG_DIR"; then
+        echo "diagnostic directory must not overlap persisted config" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PERSISTED_CONFIG_DIR:-}" ] \
+        && published_path "$DEBIAN_SSH_PERSISTED_CONFIG_DIR" "$diag"; then
+        echo "diagnostic directory must not overlap persisted config" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_FRP_STATE_DIR:-}" ] \
+        && published_path "$diag" "$DEBIAN_FRP_STATE_DIR"; then
+        echo "diagnostic directory must not overlap FRP state" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_FRP_STATE_DIR:-}" ] \
+        && published_path "$DEBIAN_FRP_STATE_DIR" "$diag"; then
+        echo "diagnostic directory must not overlap FRP state" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PERSISTENCE_PATH:-}" ] \
+        && published_path "$DEBIAN_SSH_PERSISTENCE_PATH" "$diag"; then
+        echo "diagnostic directory must not contain the persistence path" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PUBLIC_HEALTH_DIR:-}" ] \
+        && published_path "$diag" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR"; then
+        echo "diagnostic directory must not overlap the public health root" >&2
+        return 1
+    fi
+    if [ -n "${DEBIAN_SSH_PUBLIC_HEALTH_DIR:-}" ] \
+        && published_path "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" "$diag"; then
+        echo "diagnostic directory must not overlap the public health root" >&2
+        return 1
+    fi
+    conf="${DEBIAN_SSH_PUBLIC_HTTPD_CONF:-}"
+    if [ -n "$conf" ]; then
+        conf_dir="${conf%/*}"
+        if [ "$conf_dir" != "$conf" ] \
+            && published_path "$diag" "$conf_dir"; then
+            echo "diagnostic directory must not overlap the httpd config directory" >&2
+            return 1
+        fi
+        if [ "$conf_dir" != "$conf" ] \
+            && published_path "$conf_dir" "$diag"; then
+            echo "diagnostic directory must not overlap the httpd config directory" >&2
+            return 1
+        fi
+    fi
+    for cap_dir in $DEBIAN_SSH_CAP_CONFIG_DIRS; do
+        if published_path "$diag" "$cap_dir" \
+            || published_path "$cap_dir" "$diag"; then
+            echo "diagnostic directory must not overlap a CAP config directory" >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+empty_directory() {
+    dir="$1"
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    canon="$(cd -P "$dir" && pwd)" || return 1
+    if [ "$canon" = "/" ]; then
+        echo "refusing to empty /" >&2
+        return 1
+    fi
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        rm -rf "$entry" || return 1
+    done
+}
+
+# The previous image wrote diagnostics into $HOME/health and served that
+# directory. It is tenant-writable and is no longer an HTTP root, so only
+# those known diagnostic names are removed. Customer scripts and configs
+# stay. A symlink is left alone: following it would delete files elsewhere.
+scrub_former_health_diagnostics() {
+    dir="$1"
+    [ -n "$dir" ] || return 0
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+    rm -f \
+        "$dir/debug.txt" \
+        "$dir/startup-error.txt" \
+        "$dir/debug.txt.tmp" \
+        "$dir/startup-error.txt.tmp" \
+        "$dir"/debug.txt.tmp.* \
+        "$dir"/startup-error.txt.tmp.*
+}
+
 start_health() {
-    busybox httpd -f -p "0.0.0.0:${DEBIAN_HEALTH_PORT}" -h "$DEBIAN_SSH_HOME/health" &
+    [ -n "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" ] || return 1
+    [ -n "$DEBIAN_SSH_LOCAL_DIAG_DIR" ] || return 1
+    [ -n "$DEBIAN_SSH_PUBLIC_HTTPD_CONF" ] || return 1
+    [ -n "$DEBIAN_HEALTH_PORT" ] || return 1
+    [ -n "$DEBIAN_HEALTH_LOCAL_PORT" ] || return 1
+    # Refuse before prepare_secret_dir or empty_directory. Those mutate the
+    # configured path, including when it is an ancestor of durable state.
+    refuse_health_ports || return 1
+    refuse_public_health_overlap || return 1
+    refuse_httpd_conf_dir || return 1
+    refuse_diag_dir || return 1
+    prepare_secret_dir "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" || return 1
+    prepare_secret_dir "$DEBIAN_SSH_LOCAL_DIAG_DIR" || return 1
+    # The previous image left files in this inode. Empty it so cgi-bin,
+    # nested httpd.conf, and symlinks cannot survive an upgrade.
+    empty_directory "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" || return 1
+    scrub_former_health_diagnostics "$DEBIAN_SSH_HOME/health" || return 1
+    rm -rf "$DEBIAN_SSH_LOCAL_DIAG_DIR/cgi-bin" "$DEBIAN_SSH_LOCAL_DIAG_DIR/httpd.conf" || return 1
+    conf_dir="${DEBIAN_SSH_PUBLIC_HTTPD_CONF%/*}"
+    [ "$conf_dir" != "$DEBIAN_SSH_PUBLIC_HTTPD_CONF" ] || conf_dir="."
+    if [ "$conf_dir" != "." ]; then
+        prepare_secret_dir "$conf_dir" || return 1
+    fi
+    : >"$DEBIAN_SSH_PUBLIC_HTTPD_CONF" || return 1
+    chmod 600 "$DEBIAN_SSH_PUBLIC_HTTPD_CONF" || return 1
+    busybox httpd -f -c "$DEBIAN_SSH_PUBLIC_HTTPD_CONF" -p "0.0.0.0:${DEBIAN_HEALTH_PORT}" -h "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" &
     HEALTH_PID="$!"
+    busybox httpd -f -c "$DEBIAN_SSH_PUBLIC_HTTPD_CONF" -p "127.0.0.1:${DEBIAN_HEALTH_LOCAL_PORT}" -h "$DEBIAN_SSH_LOCAL_DIAG_DIR" &
+    HEALTH_LOCAL_PID="$!"
 }
 
 start_sshd() {
@@ -721,22 +1306,123 @@ ssh_ready() {
     awk -v port=":${port_hex}" '$2 ~ port "$" && $4 == "0A" { found=1 } END { exit found ? 0 : 1 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
+# busybox httpd serves every name in the docroot, including *.tmp and
+# dotfiles. Stage beside the served directory, then rename in, so a refresh
+# never publishes a fourth public path. The stage is a new directory: adopting
+# an existing sibling would chmod it 0700 and truncate matching names.
+health_publish_parent() {
+    root="$DEBIAN_SSH_PUBLIC_HEALTH_DIR"
+    [ -n "$root" ] || return 1
+    while [ "$root" != "/" ] && [ "${root%/}" != "$root" ]; do
+        root="${root%/}"
+    done
+    [ "$root" != "/" ] || return 1
+    parent="${root%/*}"
+    [ "$parent" != "$root" ] || return 1
+    # /health has an empty ${root%/*}. Stage under /, not fail closed.
+    [ -n "$parent" ] || parent="/"
+    printf '%s\n' "$parent"
+}
+
+# Only remove a directory this process created with mktemp. A customer
+# directory that happens to use the prefix must not be deleted.
+remove_health_publish_stage() {
+    stage="$1"
+    [ -n "$stage" ] || return 0
+    case "$stage" in
+        */.enclava-health-stage.??????) ;;
+        *)
+            echo "refusing to remove unexpected health publish stage" >&2
+            return 1
+            ;;
+    esac
+    [ "$stage" != "/" ] || return 1
+    rm -rf "$stage"
+}
+
+# Fresh private directory beside the public root, on the same filesystem, so
+# mv is a rename. Never adopt an existing name.
+make_health_publish_stage() {
+    parent="$(health_publish_parent)" || return 1
+    [ -d "$parent" ] || return 1
+    stage="$(umask 077 && mktemp -d "${parent}/.enclava-health-stage.XXXXXX")" || return 1
+    case "$stage" in
+        */.enclava-health-stage.??????) ;;
+        *)
+            rm -rf "$stage" 2>/dev/null || true
+            return 1
+            ;;
+    esac
+    if [ ! -d "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" ] || [ -L "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" ]; then
+        remove_health_publish_stage "$stage" 2>/dev/null || rm -rf "$stage" 2>/dev/null || true
+        return 1
+    fi
+    public_dev="$(stat -c %d "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" 2>/dev/null)" || {
+        remove_health_publish_stage "$stage" 2>/dev/null || true
+        return 1
+    }
+    stage_dev="$(stat -c %d "$stage" 2>/dev/null)" || {
+        remove_health_publish_stage "$stage" 2>/dev/null || true
+        return 1
+    }
+    if [ "$public_dev" != "$stage_dev" ]; then
+        echo "health publish stage is not on the public root filesystem" >&2
+        remove_health_publish_stage "$stage" 2>/dev/null || true
+        return 1
+    fi
+    if published_path "$stage" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" \
+        || published_path "$DEBIAN_SSH_PUBLIC_HEALTH_DIR" "$stage"; then
+        echo "health publish stage overlaps the public health root" >&2
+        remove_health_publish_stage "$stage" 2>/dev/null || true
+        return 1
+    fi
+    chown_if_root 0:0 "$stage" || {
+        remove_health_publish_stage "$stage" 2>/dev/null || true
+        return 1
+    }
+    chmod 700 "$stage" || {
+        remove_health_publish_stage "$stage" 2>/dev/null || true
+        return 1
+    }
+    printf '%s\n' "$stage"
+}
+
 publish_ready() {
-    printf 'ssh -p %s %s@%s\n' "$FRP_REMOTE_PORT" "$DEBIAN_SSH_USER" "$FRP_PUBLIC_HOST" >"$DEBIAN_SSH_HOME/health/ssh.txt.tmp"
-    printf 'tcp://%s:%s\n' "$FRP_PUBLIC_HOST" "$FRP_REMOTE_PORT" >"$DEBIAN_SSH_HOME/health/frp-url.txt.tmp"
-    printf 'ok\n' >"$DEBIAN_SSH_HOME/health/healthz.tmp"
-    mv "$DEBIAN_SSH_HOME/health/ssh.txt.tmp" "$DEBIAN_SSH_HOME/health/ssh.txt"
-    mv "$DEBIAN_SSH_HOME/health/frp-url.txt.tmp" "$DEBIAN_SSH_HOME/health/frp-url.txt"
-    mv "$DEBIAN_SSH_HOME/health/healthz.tmp" "$DEBIAN_SSH_HOME/health/healthz"
+    stage="$(make_health_publish_stage)" || return 1
+    printf 'ssh -p %s %s@%s\n' "$FRP_REMOTE_PORT" "$DEBIAN_SSH_USER" "$FRP_PUBLIC_HOST" >"$stage/ssh.txt" || {
+        remove_health_publish_stage "$stage" || true
+        return 1
+    }
+    printf 'tcp://%s:%s\n' "$FRP_PUBLIC_HOST" "$FRP_REMOTE_PORT" >"$stage/frp-url.txt" || {
+        remove_health_publish_stage "$stage" || true
+        return 1
+    }
+    printf 'ok\n' >"$stage/healthz" || {
+        remove_health_publish_stage "$stage" || true
+        return 1
+    }
+    mv -f "$stage/ssh.txt" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR/ssh.txt" || {
+        remove_health_publish_stage "$stage" || true
+        return 1
+    }
+    mv -f "$stage/frp-url.txt" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR/frp-url.txt" || {
+        remove_health_publish_stage "$stage" || true
+        return 1
+    }
+    mv -f "$stage/healthz" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR/healthz" || {
+        remove_health_publish_stage "$stage" || true
+        return 1
+    }
+    remove_health_publish_stage "$stage" || return 1
     touch "$DEBIAN_SSH_READY_MARKER" 2>/dev/null || true
 }
 
 mark_unready() {
-    rm -f "$DEBIAN_SSH_HOME/health/healthz" "$DEBIAN_SSH_HOME/health/ssh.txt" "$DEBIAN_SSH_HOME/health/frp-url.txt"
+    rm -f "$DEBIAN_SSH_PUBLIC_HEALTH_DIR/healthz" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR/ssh.txt" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR/frp-url.txt"
 }
 
 write_process_snapshot() {
-    for process_pid in "${HEALTH_PID:-}" "${SSHD_PID:-}" "${FRPC_PID:-}"; do
+    for process_pid in "${HEALTH_PID:-}" "${HEALTH_LOCAL_PID:-}" "${SSHD_PID:-}" "${FRPC_PID:-}"; do
         [ -r "/proc/${process_pid}/status" ] || continue
         awk -v pid="$process_pid" '
             $1 == "Name:" { name = $2 }
@@ -752,6 +1438,10 @@ write_process_snapshot() {
 }
 
 write_debug_snapshot() {
+    if published_path "$DEBIAN_SSH_DEBUG_FILE" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR"; then
+        echo "refusing to publish debug snapshot on the public health port" >&2
+        return 1
+    fi
     mkdir -p "${DEBIAN_SSH_DEBUG_FILE%/*}" 2>/dev/null || return 0
     {
         printf 'timestamp=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
@@ -764,14 +1454,26 @@ write_debug_snapshot() {
         -e 's/(FRP_AUTH_TOKEN|FRP_TUNNEL_SECRET)=[^ ]+/\1=<redacted>/g' \
         -e 's/(token|secret|authorization)([^A-Za-z0-9_-]*).*/\1 <redacted>/I' \
         >"$DEBIAN_SSH_DEBUG_FILE.tmp" 2>/dev/null || return 0
-    mv "$DEBIAN_SSH_DEBUG_FILE.tmp" "$DEBIAN_SSH_DEBUG_FILE" 2>/dev/null || true
+    mv "$DEBIAN_SSH_DEBUG_FILE.tmp" "$DEBIAN_SSH_DEBUG_FILE" 2>/dev/null || return 0
+    chmod 600 "$DEBIAN_SSH_DEBUG_FILE" 2>/dev/null || true
 }
 
 fail() {
     message="$1"
     echo "$message" >&2
-    mkdir -p "$DEBIAN_SSH_HOME/health" 2>/dev/null || true
-    printf '%s\n' "$message" >"$DEBIAN_SSH_HOME/health/startup-error.txt" 2>/dev/null || true
+    err_file="$DEBIAN_SSH_STARTUP_ERROR_FILE"
+    if published_path "$err_file" "$DEBIAN_SSH_PUBLIC_HEALTH_DIR"; then
+        echo "refusing to publish startup-error on the public health port" >&2
+    else
+        err_dir="${err_file%/*}"
+        [ -n "$err_dir" ] && [ "$err_dir" != "$err_file" ] && mkdir -p "$err_dir" 2>/dev/null || true
+        # Replace a symlink instead of following it into the docroot.
+        [ ! -L "$err_file" ] || rm -f "$err_file" 2>/dev/null || true
+        err_tmp="${err_file}.tmp.$$"
+        if (umask 077 && printf '%s\n' "$message" >"$err_tmp"); then
+            mv -f "$err_tmp" "$err_file" 2>/dev/null || rm -f "$err_tmp" 2>/dev/null || true
+        fi
+    fi
     if [ "$DEBIAN_SSH_WRAPPED" = "1" ]; then
         exit 1
     fi
@@ -780,11 +1482,11 @@ fail() {
 }
 
 cleanup() {
-    for pid in "${FRPC_PID:-}" "${SSHD_PID:-}" "${HEALTH_PID:-}"; do
+    for pid in "${FRPC_PID:-}" "${SSHD_PID:-}" "${HEALTH_PID:-}" "${HEALTH_LOCAL_PID:-}"; do
         [ -n "$pid" ] || continue
         kill -TERM "$pid" 2>/dev/null || true
     done
-    for pid in "${FRPC_PID:-}" "${SSHD_PID:-}" "${HEALTH_PID:-}"; do
+    for pid in "${FRPC_PID:-}" "${SSHD_PID:-}" "${HEALTH_PID:-}" "${HEALTH_LOCAL_PID:-}"; do
         [ -n "$pid" ] || continue
         wait "$pid" 2>/dev/null || true
     done
